@@ -35,8 +35,10 @@ const PROCESSING_LEASE_MS = 15 * 60 * 1_000;
 const QUEUE_RETRY_BASE_SECONDS = 60;
 const QUEUE_RETRY_MAX_SECONDS = 24 * 60 * 60;
 const PREVIOUS_RUN_WINDOW_MS = 24 * 60 * 60 * 1_000;
+const RUN_HEARTBEAT_STALE_MS = 2 * 60 * 60 * 1_000;
 const PRODUCER_LOCK_LEASE_MS = 5 * 60 * 1_000;
 const PRODUCER_LOCK_NAME = "catalog_outbox_producer";
+const FEED_TASKS_DLQ_NAME = "podcast-monitor-dlq-finance-production";
 const QUEUE_SEND_BATCH_SIZE = 100;
 const QUEUE_MESSAGE_SAFE_BYTES = 120_000;
 const QUEUE_SEND_BATCH_SAFE_BYTES = 240_000;
@@ -296,6 +298,118 @@ async function getRunStatus(runId: string, env: WorkerEnv): Promise<string | nul
     .bind(runId)
     .first<StatusRow>();
   return row?.status ?? null;
+}
+
+export async function reconcilePreviousRuns(input: {
+  database: D1Database;
+  currentRunId: string;
+  previousRunWindowStart: string;
+  scheduledAt: string;
+  checkedAt: string;
+}): Promise<{ skipped: boolean; staleRunCount: number }> {
+  const staleHeartbeatBefore = new Date(
+    Date.parse(input.checkedAt) - RUN_HEARTBEAT_STALE_MS,
+  ).toISOString();
+  const results = await input.database.batch([
+    input.database
+      .prepare(
+        `UPDATE feed_tasks
+        SET status = 'failed',
+            finished_at = COALESCE(finished_at, ?),
+            error_code = COALESCE(error_code, 'stale_run_timeout'),
+            error_summary = COALESCE(error_summary, 'stale_run_timeout')
+        WHERE status IN ('pending_enqueue', 'queued', 'processing', 'retrying')
+          AND run_id IN (
+            SELECT run_id
+            FROM runs
+            WHERE run_id <> ?
+              AND scheduled_at >= ?
+              AND scheduled_at < ?
+              AND status IN ('creating', 'queued', 'running')
+              AND heartbeat_at < ?
+          )`,
+      )
+      .bind(
+        input.checkedAt,
+        input.currentRunId,
+        input.previousRunWindowStart,
+        input.scheduledAt,
+        staleHeartbeatBefore,
+      ),
+    input.database
+      .prepare(
+        `UPDATE runs
+        SET status = 'failed',
+            finished_at = COALESCE(finished_at, ?),
+            heartbeat_at = ?,
+            succeeded_feed_count = COALESCE((
+              SELECT SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END)
+              FROM feed_tasks
+              WHERE run_id = runs.run_id
+            ), 0),
+            failed_feed_count = COALESCE((
+              SELECT SUM(CASE WHEN status IN ('failed', 'dead_lettered') THEN 1 ELSE 0 END)
+              FROM feed_tasks
+              WHERE run_id = runs.run_id
+            ), 0),
+            new_episode_count = COALESCE((
+              SELECT SUM(notion_write_count)
+              FROM feed_tasks
+              WHERE run_id = runs.run_id
+            ), 0),
+            parent_update_count = COALESCE((
+              SELECT SUM(parent_update_count)
+              FROM feed_tasks
+              WHERE run_id = runs.run_id
+            ), 0),
+            error_summary = 'stale_run_timeout'
+        WHERE run_id <> ?
+          AND scheduled_at >= ?
+          AND scheduled_at < ?
+          AND status IN ('creating', 'queued', 'running')
+          AND heartbeat_at < ?`,
+      )
+      .bind(
+        input.checkedAt,
+        input.checkedAt,
+        input.currentRunId,
+        input.previousRunWindowStart,
+        input.scheduledAt,
+        staleHeartbeatBefore,
+      ),
+    input.database
+      .prepare(
+        `UPDATE runs
+        SET status = 'skipped_previous_run_active',
+            finished_at = ?,
+            heartbeat_at = ?,
+            error_summary = 'previous_run_active'
+        WHERE run_id = ?
+          AND status = 'creating'
+          AND EXISTS (
+            SELECT 1
+            FROM runs AS previous
+            WHERE previous.run_id <> ?
+              AND previous.scheduled_at >= ?
+              AND previous.scheduled_at < ?
+              AND previous.status IN ('creating', 'queued', 'running')
+              AND previous.heartbeat_at >= ?
+          )`,
+      )
+      .bind(
+        input.checkedAt,
+        input.checkedAt,
+        input.currentRunId,
+        input.currentRunId,
+        input.previousRunWindowStart,
+        input.scheduledAt,
+        staleHeartbeatBefore,
+      ),
+  ]);
+  return {
+    staleRunCount: results[1]?.meta.changes ?? 0,
+    skipped: (results[2]?.meta.changes ?? 0) > 0,
+  };
 }
 
 async function getRunOutbox(runId: string, env: WorkerEnv): Promise<OutboxRow[]> {
@@ -671,27 +785,25 @@ async function handleProducer(
     }
 
     const checkedAt = new Date().toISOString();
-    const skipped = await env.DB.prepare(
-      `UPDATE runs
-      SET status = 'skipped_previous_run_active',
-          finished_at = ?,
-          heartbeat_at = ?,
-          error_summary = 'previous_run_active'
-      WHERE run_id = ?
-        AND status = 'creating'
-        AND EXISTS (
-          SELECT 1
-          FROM runs AS previous
-          WHERE previous.run_id <> ?
-            AND previous.scheduled_at >= ?
-            AND previous.scheduled_at < ?
-            AND previous.status IN ('creating', 'queued', 'running')
-        )`,
-    )
-      .bind(checkedAt, checkedAt, runId, runId, previousRunWindowStart, scheduledAt)
-      .run();
+    const previousRuns = await reconcilePreviousRuns({
+      database: env.DB,
+      currentRunId: runId,
+      previousRunWindowStart,
+      scheduledAt,
+      checkedAt,
+    });
 
-    if (skipped.meta.changes > 0) {
+    if (previousRuns.staleRunCount > 0) {
+      writeLog({
+        level: "error",
+        event: "stale_runs_failed",
+        error_code: "stale_run_timeout",
+        run_id: runId,
+        issue_count: previousRuns.staleRunCount,
+      });
+    }
+
+    if (previousRuns.skipped) {
       writeLog({
         level: "error",
         event: "scheduled_run_skipped",
@@ -1194,7 +1306,130 @@ async function finalizeTaskFailed(
   return (results[0]?.meta.changes ?? 0) > 0;
 }
 
-async function handleQueue(batch: MessageBatch<FeedTaskMessage>, env: WorkerEnv): Promise<void> {
+async function finalizeTaskDeadLettered(
+  body: FeedTaskMessage,
+  env: WorkerEnv,
+): Promise<boolean> {
+  const finishedAt = new Date().toISOString();
+  const results = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE feed_tasks
+      SET status = 'dead_lettered',
+          finished_at = ?,
+          error_code = COALESCE(error_code, 'queue_retries_exhausted'),
+          error_summary = COALESCE(error_summary, 'queue_retries_exhausted')
+      WHERE task_id = ?
+        AND run_id = ?
+        AND status IN ('pending_enqueue', 'queued', 'processing', 'retrying')`,
+    ).bind(finishedAt, body.task_id, body.run_id),
+    env.DB.prepare(
+      `UPDATE runs
+      SET failed_feed_count = failed_feed_count + 1,
+          new_episode_count = new_episode_count + COALESCE((
+            SELECT notion_write_count FROM feed_tasks
+            WHERE task_id = ? AND run_id = ?
+          ), 0),
+          parent_update_count = parent_update_count + COALESCE((
+            SELECT parent_update_count FROM feed_tasks
+            WHERE task_id = ? AND run_id = ?
+          ), 0),
+          status = CASE
+            WHEN succeeded_feed_count + failed_feed_count + 1 >= unique_feed_count
+              THEN CASE WHEN succeeded_feed_count = 0 THEN 'failed' ELSE 'partial' END
+            ELSE 'running'
+          END,
+          finished_at = CASE
+            WHEN succeeded_feed_count + failed_feed_count + 1 >= unique_feed_count
+              THEN ?
+            ELSE finished_at
+          END,
+          heartbeat_at = ?,
+          error_summary = 'queue_retries_exhausted'
+      WHERE run_id = ?
+        AND EXISTS (
+          SELECT 1
+          FROM feed_tasks
+          WHERE task_id = ?
+            AND run_id = ?
+            AND status = 'dead_lettered'
+            AND finished_at = ?
+        )`,
+    ).bind(
+      body.task_id,
+      body.run_id,
+      body.task_id,
+      body.run_id,
+      finishedAt,
+      finishedAt,
+      body.run_id,
+      body.task_id,
+      body.run_id,
+      finishedAt,
+    ),
+  ]);
+  return (results[0]?.meta.changes ?? 0) > 0;
+}
+
+async function handleDeadLetterQueue(
+  batch: MessageBatch<FeedTaskMessage>,
+  env: WorkerEnv,
+): Promise<void> {
+  for (const message of batch.messages) {
+    const body: unknown = message.body;
+    try {
+      if (!isFeedTaskMessage(body)) {
+        writeLog({
+          level: "error",
+          event: "dlq_message_rejected",
+          error_code: "invalid_queue_message",
+          attempts: message.attempts,
+        });
+        continue;
+      }
+
+      if (await finalizeTaskDeadLettered(body, env)) {
+        writeLog({
+          level: "error",
+          event: "queue_task_dead_lettered",
+          error_code: "queue_retries_exhausted",
+          run_id: body.run_id,
+          task_id: body.task_id,
+          status: "dead_lettered",
+          attempts: message.attempts,
+        });
+      } else {
+        writeLog({
+          level: "warn",
+          event: "dlq_task_terminal_or_missing",
+          error_code: "feed_task_not_updated",
+          run_id: body.run_id,
+          task_id: body.task_id,
+          attempts: message.attempts,
+        });
+      }
+    } catch {
+      writeLog({
+        level: "error",
+        event: "dlq_d1_error",
+        error_code: "queue_d1_error",
+        ...(isFeedTaskMessage(body) ? { run_id: body.run_id, task_id: body.task_id } : {}),
+        attempts: message.attempts,
+      });
+    } finally {
+      message.ack();
+    }
+  }
+}
+
+export async function handleQueue(
+  batch: MessageBatch<FeedTaskMessage>,
+  env: WorkerEnv,
+): Promise<void> {
+  if (batch.queue === FEED_TASKS_DLQ_NAME) {
+    await handleDeadLetterQueue(batch, env);
+    return;
+  }
+
   for (const message of batch.messages) {
     const body: unknown = message.body;
     const retryDelaySeconds = queueRetryDelaySeconds(message.attempts);
