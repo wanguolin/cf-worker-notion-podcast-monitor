@@ -217,7 +217,7 @@ describe("XML safety limits", () => {
           <itunes:image href="https://cdn.example.com/cover.jpg"/>
           <podcast:transcript url="https://example.com/transcript.json" type="application/json"/>
           <enclosure url="https://cdn.example.com/episode.mp3" type="audio/mpeg" length="123456"/>
-          <content:encoded><![CDATA[${"长".repeat(100)}]]></content:encoded>
+          <content:encoded><![CDATA[<p>Alpha &amp; Beta</p><p>${"长".repeat(100)}</p>]]></content:encoded>
         </item></channel>
       </rss>`);
     const result = await fetchAndParseFeed("https://feeds.example.com/extended.xml", WINDOW, {
@@ -227,7 +227,7 @@ describe("XML safety limits", () => {
     });
     expect(result.items[0]).toMatchObject({
       author: "Author A",
-      description: "长".repeat(20),
+      description: `Alpha & Beta\n${"长".repeat(7)}`,
       description_truncated: true,
       duration: "01:02:03",
       season: "2",

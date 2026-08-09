@@ -3,7 +3,7 @@ import {
   loadCatalogParentPages,
   loadPodcastCatalog,
 } from "./catalog";
-import { shouldWriteFeed } from "./canary";
+import { determineWriteMode, shouldWriteFeedTask } from "./canary";
 import {
   createNotionClient,
   notionJsonBody,
@@ -96,6 +96,7 @@ type StructuredLog = {
   parent_update_count?: number;
   description_truncated?: number;
   write_enabled?: boolean;
+  skipped_categories?: string[];
 };
 
 type JsonRecord = Record<string, unknown>;
@@ -1301,11 +1302,12 @@ async function handleQueue(batch: MessageBatch<FeedTaskMessage>, env: WorkerEnv)
           },
         );
         const notionClient = createNotionClient(env.NOTION_TOKEN, { softDeadlineAt });
-        const writeEnabled = shouldWriteFeed(
+        const writeEnabled = shouldWriteFeedTask(
           Boolean(env.DRY_RUN),
           env.CANARY_FEED_HASHES,
           body.feed_url_hash,
-        ) && body.force_dry_run !== true;
+          body.force_dry_run === true,
+        );
         let outcome: TaskProcessingOutcome;
         if (writeEnabled) {
           const writes = await writeEpisodes({
@@ -1322,6 +1324,17 @@ async function handleQueue(batch: MessageBatch<FeedTaskMessage>, env: WorkerEnv)
             taskId: body.task_id,
             windowItemCount: result.window_item_count,
           });
+          if (writes.skipped_categories.length > 0) {
+            writeLog({
+              level: "warn",
+              event: "episode_categories_skipped",
+              error_code: "episode_category_not_allowed",
+              run_id: body.run_id,
+              task_id: body.task_id,
+              issue_count: writes.skipped_categories.length,
+              skipped_categories: writes.skipped_categories,
+            });
+          }
           const taskWriteCount = await countTaskEpisodeWrites(env.DB, body.task_id);
           let parentUpdateCount = 0;
           if (taskWriteCount > 0 && body.parent_page_ids.length > 0) {
@@ -1492,10 +1505,6 @@ async function handleQueue(batch: MessageBatch<FeedTaskMessage>, env: WorkerEnv)
 }
 
 async function runRssSelftest(request: Request, env: WorkerEnv): Promise<Response> {
-  if (!env.DRY_RUN) {
-    return json({ ok: false, error: "dry_run_required" }, 409);
-  }
-
   const contentLength = request.headers.get("Content-Length");
   if (contentLength !== null && Number(contentLength) > 4_096) {
     return json({ ok: false, error: "request_too_large" }, 413);
@@ -1522,7 +1531,10 @@ async function runRssSelftest(request: Request, env: WorkerEnv): Promise<Respons
     if (rows.length !== 1) {
       return json({ ok: false, error: "selftest_run_not_found" }, 404);
     }
-    const replayBody = parseOutboxMessage(rows[0]!);
+    const replayBody: FeedTaskMessage = {
+      ...parseOutboxMessage(rows[0]!),
+      force_dry_run: true,
+    };
     await env.FEED_TASKS_QUEUE.send(replayBody, { contentType: "json" });
     writeLog({
       level: "info",
@@ -1690,12 +1702,17 @@ async function runManualTrigger(env: WorkerEnv): Promise<Response> {
         409,
       );
     }
-    const canaryWritesEnabled = env.CANARY_FEED_HASHES.trim() !== "";
+    const writeMode = determineWriteMode(
+      Boolean(env.DRY_RUN),
+      env.CANARY_FEED_HASHES,
+    );
+    const canaryWritesEnabled = writeMode === "canary";
     return json(
       {
         ok: true,
-        dry_run: !canaryWritesEnabled,
+        dry_run: writeMode === "dry_run",
         canary_writes_enabled: canaryWritesEnabled,
+        write_mode: writeMode,
         run_id: runId,
         status,
       },
@@ -1822,9 +1839,6 @@ export default {
       }
       if (!(await isAuthorized(request, env.MANUAL_TRIGGER_TOKEN))) {
         return json({ ok: false, error: "unauthorized" }, 401);
-      }
-      if (!env.DRY_RUN) {
-        return json({ ok: false, error: "dry_run_required" }, 409);
       }
       if (!env.NOTION_TOKEN) {
         return json({ ok: false, error: "service_not_configured" }, 503);

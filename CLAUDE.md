@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概览
 
-Cloudflare Worker：每日抓取"财经播客监控"Notion 库中的 RSS，流式解析后把 26 小时窗口内的新单集严格排重写入"财经播客单集库"，并更新播客父页的"内容同步时间"。**plan.md 是权威实施计划**（架构、约束、验收标准、阶段门槛都在里面）；业务规则以 Notion 页面"财经播客 RSS 云端增量同步"为准。改动行为前先对照 plan.md。
+Cloudflare Worker：每日 00:00（Asia/Shanghai，Cron `0 16 * * *` UTC）抓取"财经播客监控"Notion 库中的 RSS，流式解析后把 26 小时窗口内的新单集严格排重写入"财经播客单集库"，并更新播客父页的"内容同步时间"。**业务规则以 Notion 页面"财经播客 RSS 云端增量同步"为准**（排重、窗口、父页更新条件、禁止事项）；工程约束见本文件"关键不变量"。原实施计划 plan.md 已在上线后删除，历史版本可在 git 历史中查看。
 
 ## 常用命令
 
@@ -51,6 +51,6 @@ queue() → Consumer：单 Feed 串行——流式下载解析 → 26h 窗口 �
 ## 其他约定
 
 - compatibility_date 受本地 wrangler 内置 workerd 上限约束（当前 2026-08-08），升级 wrangler 前不要手动调后。
-- 生产 Cron 尚未配置（阶段 5 才启用，见 plan.md §11）；不要在 wrangler.jsonc 里提前加 triggers。
+- 生产 Cron 为 `0 16 * * *`（每日 00:00 Asia/Shanghai）；DRY_RUN=false、CANARY_FEED_HASHES 为空即全量真实写入。回滚开关：置 DRY_RUN=true 重新部署即停写。
 - 大体积测试 fixture 由 `test/fixtures/generate-feed.ts` 生成，不提交大文件进 git。
 - 日志为 JSON 单行结构化格式，含稳定 error_code；绝不输出 token、Authorization 或完整 Feed URL。

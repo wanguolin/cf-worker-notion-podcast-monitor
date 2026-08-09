@@ -21,3 +21,22 @@ export function shouldWriteFeed(
     ? allowlist.has(feedUrlHash.toLowerCase())
     : !dryRun;
 }
+
+export function shouldWriteFeedTask(
+  dryRun: boolean,
+  canaryFeedHashes: string,
+  feedUrlHash: string,
+  forceDryRun = false,
+): boolean {
+  return !forceDryRun && shouldWriteFeed(dryRun, canaryFeedHashes, feedUrlHash);
+}
+
+export function determineWriteMode(
+  dryRun: boolean,
+  canaryFeedHashes: string,
+): "canary" | "dry_run" | "full" {
+  if (canaryFeedHashes.trim() !== "") {
+    return "canary";
+  }
+  return dryRun ? "dry_run" : "full";
+}

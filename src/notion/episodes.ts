@@ -56,7 +56,11 @@ type EpisodeSemantic =
   | "title"
   | "transcript";
 
-type EpisodeProperty = { name: string; type: WritablePropertyType };
+type EpisodeProperty = {
+  name: string;
+  option_names?: string[];
+  type: WritablePropertyType;
+};
 
 export type EpisodeWriteSchema = {
   dedup: EpisodeDedupSchema;
@@ -73,6 +77,7 @@ export type EpisodePropertyContext = {
 export type EpisodePropertiesResult = {
   description_truncated: boolean;
   properties: JsonRecord;
+  skipped_categories: string[];
 };
 
 export type EpisodeWriteResult = {
@@ -80,6 +85,7 @@ export type EpisodeWriteResult = {
   dedup_failed: number;
   description_truncated: number;
   notion_write_count: number;
+  skipped_categories: string[];
   will_write: number;
 };
 
@@ -137,7 +143,7 @@ const PROPERTY_ALIASES: Record<EpisodeSemantic, string[]> = {
   media_length: ["媒体长度", "媒体大小", "Media Length"],
   media_type: ["媒体类型", "Media Type", "MIME Type"],
   original_link: ["原始链接", "单集链接", "Original Link"],
-  podcast_categories: ["播客分类", "清单分类", "Podcast Categories"],
+  podcast_categories: ["分类", "播客分类", "清单分类", "Podcast Categories"],
   podcast_name: ["播客名称", "Podcast Name"],
   published_at: ["发布日期", "发布时间", "Published At", "Publication Date"],
   rss_categories: ["RSS分类", "RSS 分类", "RSS Categories"],
@@ -170,6 +176,24 @@ function isWritablePropertyType(value: unknown): value is WritablePropertyType {
   ].includes(String(value));
 }
 
+function schemaProperty(
+  name: string,
+  property: JsonRecord,
+  type: WritablePropertyType,
+): EpisodeProperty {
+  if (
+    type !== "multi_select" ||
+    !isRecord(property.multi_select) ||
+    !Array.isArray(property.multi_select.options)
+  ) {
+    return { name, type };
+  }
+  const optionNames = property.multi_select.options.flatMap((option) =>
+    isRecord(option) && typeof option.name === "string" ? [option.name] : [],
+  );
+  return { name, type, option_names: optionNames };
+}
+
 export function resolveEpisodeWriteSchema(data: unknown): EpisodeWriteSchema {
   if (!isRecord(data) || !isRecord(data.properties)) {
     throw new EpisodeWriteError("episode_schema_invalid");
@@ -194,7 +218,7 @@ export function resolveEpisodeWriteSchema(data: unknown): EpisodeWriteSchema {
         ? "title"
         : aliasToSemantic.get(normalizePropertyName(name));
     if (semantic !== undefined && properties[semantic] === undefined) {
-      properties[semantic] = { name, type: property.type };
+      properties[semantic] = schemaProperty(name, property, property.type);
     }
   }
 
@@ -296,6 +320,13 @@ export function buildEpisodePageProperties(
   const description = truncateNotionRichText(item.description ?? "");
   const descriptionTruncated = Boolean(item.description_truncated) || description.truncated;
   const shanghaiTime = formatShanghaiTimestamp(new Date(item.published_at));
+  const categoryProperty = schema.properties.podcast_categories;
+  const categorySelection = filterEpisodeCategories(
+    context.categories,
+    categoryProperty?.type === "multi_select"
+      ? categoryProperty.option_names ?? []
+      : [],
+  );
 
   addProperty(properties, schema, "title", item.title);
   addProperty(properties, schema, "podcast_name", context.podcastName);
@@ -325,11 +356,42 @@ export function buildEpisodePageProperties(
   addProperty(properties, schema, "media_type", item.media_type);
   addProperty(properties, schema, "media_length", item.media_length);
   addProperty(properties, schema, "language", context.language);
-  addProperty(properties, schema, "podcast_categories", context.categories);
+  addProperty(properties, schema, "podcast_categories", categorySelection.accepted);
   addProperty(properties, schema, "dedup_source", item.dedup_source);
   addProperty(properties, schema, "description_truncated", descriptionTruncated);
 
-  return { properties, description_truncated: descriptionTruncated };
+  return {
+    properties,
+    description_truncated: descriptionTruncated,
+    skipped_categories: categorySelection.skipped,
+  };
+}
+
+const ALLOWED_EPISODE_CATEGORIES = new Set([
+  "美股投资",
+  "宏观经济金融",
+  "大科技与AI",
+]);
+
+export function filterEpisodeCategories(
+  values: string[],
+  existingOptions: string[],
+): { accepted: string[]; skipped: string[] } {
+  const accepted: string[] = [];
+  const skipped: string[] = [];
+  const existing = new Set(existingOptions);
+  for (const rawValue of values) {
+    const value = rawValue.trim();
+    if (value === "" || accepted.includes(value) || skipped.includes(value)) {
+      continue;
+    }
+    if (ALLOWED_EPISODE_CATEGORIES.has(value) && existing.has(value)) {
+      accepted.push(value);
+    } else {
+      skipped.push(value);
+    }
+  }
+  return { accepted, skipped };
 }
 
 async function loadWriteSchema(
@@ -684,6 +746,7 @@ export async function writeEpisodes(input: EpisodeWriterInput): Promise<EpisodeW
 
   let notionWriteCount = 0;
   let descriptionTruncated = 0;
+  const skippedCategories = new Set<string>();
   for (const candidate of missing) {
     await claimLedger(
       input.database,
@@ -723,6 +786,9 @@ export async function writeEpisodes(input: EpisodeWriterInput): Promise<EpisodeW
     );
 
     const built = buildEpisodePageProperties(schema, candidate, input);
+    for (const category of built.skipped_categories) {
+      skippedCategories.add(category);
+    }
     await createEpisodeWithUncertainRecheck({
       client: input.client,
       dataSourceId: input.dataSourceId,
@@ -741,6 +807,7 @@ export async function writeEpisodes(input: EpisodeWriterInput): Promise<EpisodeW
     dedup_failed: dedupFailed,
     description_truncated: descriptionTruncated,
     notion_write_count: notionWriteCount,
+    skipped_categories: [...skippedCategories].sort(),
     will_write: missing.length,
   };
 }

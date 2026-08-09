@@ -2,12 +2,14 @@ import { SaxesParser, type SaxesAttributeNS, type SaxesTagNS } from "saxes";
 
 import { createDedupKey, normalizePublishedAt, type DedupSource } from "./dedup";
 import { FeedPipelineError } from "./errors";
+import { htmlToPlainText, truncatePlainText } from "./html";
 
 const DEFAULT_MAX_XML_DEPTH = 64;
 const DEFAULT_MAX_FIELD_CHARACTERS = 8_192;
 const DEFAULT_MAX_WINDOW_ITEMS = 5_000;
 const DEFAULT_MAX_RETAINED_CHARACTERS = 4 * 1024 * 1024;
 const DEFAULT_MAX_DESCRIPTION_CHARACTERS = 2_000;
+const DEFAULT_MAX_DESCRIPTION_SOURCE_CHARACTERS = 16_000;
 const DEFAULT_MAX_LIST_VALUES = 100;
 const ENCODING_SNIFF_BYTES = 1_024;
 
@@ -78,6 +80,7 @@ export type ParseFeedOptions = {
   maxDepth?: number;
   maxFieldCharacters?: number;
   maxDescriptionCharacters?: number;
+  maxDescriptionSourceCharacters?: number;
   maxWindowItems?: number;
   maxRetainedCharacters?: number;
   softDeadlineAt?: number;
@@ -219,6 +222,8 @@ export async function parseFeedByteStream(
   const maxFieldCharacters = options.maxFieldCharacters ?? DEFAULT_MAX_FIELD_CHARACTERS;
   const maxDescriptionCharacters =
     options.maxDescriptionCharacters ?? DEFAULT_MAX_DESCRIPTION_CHARACTERS;
+  const maxDescriptionSourceCharacters =
+    options.maxDescriptionSourceCharacters ?? DEFAULT_MAX_DESCRIPTION_SOURCE_CHARACTERS;
   const maxWindowItems = options.maxWindowItems ?? DEFAULT_MAX_WINDOW_ITEMS;
   const maxRetainedCharacters =
     options.maxRetainedCharacters ?? DEFAULT_MAX_RETAINED_CHARACTERS;
@@ -260,7 +265,7 @@ export async function parseFeedByteStream(
     }
     const limit =
       capturedField.field === "description"
-        ? maxDescriptionCharacters
+        ? maxDescriptionSourceCharacters
         : maxFieldCharacters;
     const remaining = limit - capturedField.text.length;
     if (remaining <= 0) {
@@ -303,10 +308,18 @@ export async function parseFeedByteStream(
           addUniqueValue(currentItem.keywords, keyword);
         }
       } else if (capturedField.field === "description") {
-        if (value !== "" && capturedField.priority > currentItem.descriptionPriority) {
-          currentItem.description = value;
+        const plainText = truncatePlainText(
+          htmlToPlainText(value),
+          maxDescriptionCharacters,
+        );
+        if (
+          plainText.value !== "" &&
+          capturedField.priority > currentItem.descriptionPriority
+        ) {
+          currentItem.description = plainText.value;
           currentItem.descriptionPriority = capturedField.priority;
-          currentItem.descriptionTruncated = capturedField.truncated;
+          currentItem.descriptionTruncated =
+            capturedField.truncated || plainText.truncated;
         }
       } else if (value !== "" && currentItem[capturedField.field] === null) {
         currentItem[capturedField.field] = value;
@@ -335,6 +348,16 @@ export async function parseFeedByteStream(
     }
 
     if (currentItem === null) {
+      return;
+    }
+
+    if (
+      capturedField?.field === "description" &&
+      depth > capturedField.depth
+    ) {
+      if (local === "br") {
+        appendText("\n");
+      }
       return;
     }
 
@@ -426,6 +449,13 @@ export async function parseFeedByteStream(
   });
   parser.on("closetag", (tag: SaxesTagNS) => {
     const local = tag.local.toLowerCase();
+    if (
+      capturedField?.field === "description" &&
+      depth > capturedField.depth &&
+      (local === "p" || local === "li")
+    ) {
+      appendText("\n");
+    }
     if (capturedField?.depth === depth) {
       stopCapture();
     }

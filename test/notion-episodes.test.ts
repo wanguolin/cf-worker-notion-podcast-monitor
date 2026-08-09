@@ -4,6 +4,7 @@ import { createNotionClient } from "../src/notion/client";
 import {
   buildEpisodePageProperties,
   createEpisodeWithUncertainRecheck,
+  filterEpisodeCategories,
   resolveEpisodeWriteSchema,
 } from "../src/notion/episodes";
 import type { ParsedFeedItem } from "../src/rss/parser";
@@ -62,7 +63,16 @@ describe("Notion episode field mapping", () => {
         媒体类型: { type: "rich_text" },
         媒体长度: { type: "number" },
         语言: { type: "select" },
-        播客分类: { type: "multi_select" },
+        分类: {
+          type: "multi_select",
+          multi_select: {
+            options: [
+              { name: "美股投资" },
+              { name: "宏观经济金融" },
+              { name: "大科技与AI" },
+            ],
+          },
+        },
         排重来源: { type: "select" },
         简介已截断: { type: "checkbox" },
       },
@@ -70,7 +80,7 @@ describe("Notion episode field mapping", () => {
     const built = buildEpisodePageProperties(schema, item(), {
       podcastName: "知行小酒馆",
       feedUrl: "https://feeds.example.com/show.xml",
-      categories: ["投资", "商业"],
+      categories: ["美股投资", "大科技与AI", "其他"],
       language: "中文",
     });
 
@@ -85,9 +95,23 @@ describe("Notion episode field mapping", () => {
       季: { number: 2 },
       显式内容: { checkbox: false },
       RSS分类: { multi_select: [{ name: "Business" }, { name: "Technology" }] },
+      分类: { multi_select: [{ name: "美股投资" }, { name: "大科技与AI" }] },
       简介已截断: { checkbox: false },
     });
+    expect(built.skipped_categories).toEqual(["其他"]);
     expect(Object.keys(built.properties)).toHaveLength(26);
+  });
+
+  it("never creates classification options outside the fixed and existing sets", () => {
+    expect(
+      filterEpisodeCategories(
+        ["美股投资", "宏观经济金融", "大科技与AI", "未批准", "美股投资"],
+        ["美股投资", "大科技与AI"],
+      ),
+    ).toEqual({
+      accepted: ["美股投资", "大科技与AI"],
+      skipped: ["宏观经济金融", "未批准"],
+    });
   });
 
   it("truncates descriptions at the rich-text boundary and records the downgrade", () => {
