@@ -423,10 +423,10 @@ D1 不保存：
 8. 在项目目录执行 Cloudflare Secret 写入，按提示粘贴 Token：
 
    ```bash
-   npx wrangler secret put NOTION_TOKEN --env production
+   npx wrangler secret put NOTION_TOKEN --env finance-production
    ```
 
-9. staging 使用独立 PAT 和独立 Secret；不要让 production 与 staging 共用 Token。
+9. 当前只有 `finance-production` 一个环境，经用户确认使用单个 Token；未来新增环境时再评估是否拆分独立 Token。
 10. 通过远端 API 做只读授权验证：
     - `GET /v1/users/me` 应返回 `PolyMaster` 对应身份。
     - 查询 `6770eb15-6002-4bd9-8791-53f8fc968cab` 应能读到播客清单。
@@ -524,11 +524,12 @@ Public Connection OAuth 适用于让多个 Notion 用户分别安装同一个产
 
 ## 10. 项目配置约定
 
-计划中的环境分为：
+当前只部署一个环境（经用户确认，不设 staging，直接在生产验证）：
 
-- `dev`：本地 D1、模拟 Notion、固定 RSS fixture。
-- `staging`：独立 D1，真实 RSS，只读 Notion 或测试 data source。
-- `production`：真实 Notion 与每日 Cron。
+- `finance-production`：财经播客组的生产环境，绑定真实 Notion 数据库与每日 Cron；Worker 名为 `cf-worker-notion-podcast-monitor-finance-production`，对应 git 分支 `main`。
+- 本地开发用 `wrangler dev --env finance-production` 配合 `DRY_RUN` 与 fixture 控制副作用。
+
+未来新增播客关注组时，再按 10.1/10.2 的分支绑定设计扩展出新环境；该设计当前仅留档，不实施。
 
 ### 10.1 多分支 → 多播客组/多 Notion 绑定
 
@@ -558,8 +559,7 @@ Cloudflare Workers Builds 支持把同一个 GitHub 仓库连接到多个 Worker
 1. 先在本地对每个环境执行一次 `npx wrangler deploy --env <name>`，在 Dashboard 创建对应 Worker。
 2. 在 Dashboard 分别为每个环境 Worker 连接同一个 GitHub 仓库（Settings → Builds → Connect）。
 3. 每个 Worker 的 Branch control 设置：
-   - `cf-worker-notion-podcast-monitor-production` → production branch = `main`。
-   - `cf-worker-notion-podcast-monitor-staging` → production branch = `staging`。
+   - `cf-worker-notion-podcast-monitor-finance-production` → production branch = `main`。
    - 未来 `cf-worker-notion-podcast-monitor-<group>` → production branch = `<group>`。
 4. 每个 Worker 的 deploy command 设为 `npx wrangler deploy --env <name>`。
 5. 关闭 non-production branch builds，避免其他分支的 push 触发多余构建与预览部署。
@@ -615,8 +615,8 @@ Cloudflare Workers Builds 支持把同一个 GitHub 仓库连接到多个 Worker
   2. 各查询两个 data source 一页，验证读权限（使用 env vars 中的 data source ID）。
   3. 在单集库创建一条标题以 `[连通性测试]` 开头的记录，随后立即 archive，验证写权限与回收路径。
   4. 返回结构化 JSON 结果；不写 D1、不触碰任何播客父页。
-- 首次部署到 staging 环境，Secret 使用独立 staging Token。
-- production 永不暴露无鉴权的该端点；全量上线前决定删除或保留。
+- 部署到 `finance-production` 环境（经用户确认不设 staging；Notion Token 单个共用）。
+- 该端点必须始终有 `MANUAL_TRIGGER_TOKEN` 鉴权；全量上线前决定删除或保留。
 
 完成标准：远端调用 `/selftest` 四步全部成功，且单集库中的测试记录已归档、无残留。
 
