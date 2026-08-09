@@ -1,13 +1,16 @@
 import { CatalogPipelineError, loadPodcastCatalog } from "./catalog";
+import {
+  createNotionClient,
+  notionJsonBody,
+  type NotionResponse,
+} from "./notion/client";
+import { buildDryRunDiff, NotionDedupError, type DryRunDiff } from "./notion/dedup";
+import { NotionPayloadError } from "./notion/payload";
 import { sha256Hex } from "./rss/dedup";
 import { FeedPipelineError } from "./rss/errors";
 import { fetchAndParseFeed } from "./rss/fetch";
 import { normalizeAndValidateFeedUrl } from "./rss/url";
 
-const NOTION_API_BASE = "https://api.notion.com";
-const NOTION_VERSION = "2026-03-11";
-const NOTION_REQUEST_GAP_MS = 350;
-const NOTION_REQUEST_TIMEOUT_MS = 10_000;
 const FEED_TASK_SCHEMA_VERSION = 1;
 const PROCESSING_LEASE_MS = 15 * 60 * 1_000;
 const QUEUE_RETRY_BASE_SECONDS = 60;
@@ -67,6 +70,9 @@ type StructuredLog = {
   redirect_count?: number;
   retry_delay_seconds?: number;
   issue_count?: number;
+  will_write?: number;
+  already_exists?: number;
+  dedup_failed?: number;
 };
 
 type JsonRecord = Record<string, unknown>;
@@ -76,13 +82,6 @@ type StepResult = {
   ok: boolean;
   status: number;
   summary: string;
-};
-
-type NotionResult = {
-  ok: boolean;
-  status: number;
-  data: unknown;
-  errorSummary?: string;
 };
 
 function json(data: unknown, status = 200, headers?: HeadersInit): Response {
@@ -130,10 +129,6 @@ async function readBoundedJson(request: Request, maxBytes: number): Promise<unkn
   } catch {
     return null;
   }
-}
-
-function sleep(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function isRecord(value: unknown): value is JsonRecord {
@@ -324,24 +319,6 @@ function isTrashedPage(value: unknown): boolean {
   return isRecord(value) && value.object === "page" && value.in_trash === true;
 }
 
-function notionErrorSummary(status: number, data: unknown): string {
-  let summary = `Notion API returned HTTP ${status}`;
-
-  if (!isRecord(data) || data.object !== "error") {
-    return summary;
-  }
-
-  if (typeof data.code === "string") {
-    summary += ` (code: ${data.code})`;
-  }
-
-  if (typeof data.message === "string") {
-    summary += `: ${data.message.replace(/[\r\n]+/g, " ").slice(0, 120)}`;
-  }
-
-  return summary;
-}
-
 async function constantTimeEqual(provided: string, expected: string): Promise<boolean> {
   const encoder = new TextEncoder();
   const [providedHash, expectedHash] = await Promise.all([
@@ -368,51 +345,7 @@ async function isAuthorized(request: Request, expectedToken: string): Promise<bo
   return constantTimeEqual(providedToken, expectedToken);
 }
 
-function createNotionRequester(token: string) {
-  let requestCount = 0;
-
-  return async (path: string, init: RequestInit = {}): Promise<NotionResult> => {
-    if (requestCount > 0) {
-      await sleep(NOTION_REQUEST_GAP_MS);
-    }
-    requestCount += 1;
-
-    try {
-      const response = await fetch(`${NOTION_API_BASE}${path}`, {
-        ...init,
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Notion-Version": NOTION_VERSION,
-          "Content-Type": "application/json",
-          ...init.headers,
-        },
-        signal: AbortSignal.timeout(NOTION_REQUEST_TIMEOUT_MS),
-      });
-      const data: unknown = await response.json().catch(() => null);
-
-      return {
-        ok: response.ok,
-        status: response.status,
-        data,
-        ...(response.ok
-          ? {}
-          : { errorSummary: notionErrorSummary(response.status, data) }),
-      };
-    } catch (error) {
-      return {
-        ok: false,
-        status: 0,
-        data: null,
-        errorSummary:
-          error instanceof DOMException && error.name === "TimeoutError"
-            ? "Notion API request timed out"
-            : "Notion API request failed before receiving a response",
-      };
-    }
-  };
-}
-
-function failedCallStep(step: string, result: NotionResult): StepResult {
+function failedCallStep(step: string, result: NotionResponse): StepResult {
   return {
     step,
     ok: false,
@@ -434,7 +367,12 @@ function selftestResponse(env: WorkerEnv, steps: StepResult[], status: number): 
 
 async function runSelftest(env: WorkerEnv, notionToken: string): Promise<Response> {
   const steps: StepResult[] = [];
-  const notionRequest = createNotionRequester(notionToken);
+  const notionClient = createNotionClient(notionToken);
+  const notionRequest = (
+    path: string,
+    init: RequestInit = {},
+    retry = true,
+  ): Promise<NotionResponse> => notionClient.request(path, init, { retry });
 
   const identity = await notionRequest("/v1/users/me");
   if (!identity.ok) {
@@ -483,7 +421,7 @@ async function runSelftest(env: WorkerEnv, notionToken: string): Promise<Respons
 
   const monitorQuery = await notionRequest(
     `/v1/data_sources/${encodeURIComponent(env.NOTION_MONITOR_DS_ID)}/query`,
-    { method: "POST", body: JSON.stringify({ page_size: 1 }) },
+    { method: "POST", body: notionJsonBody({ page_size: 1 }) },
   );
   if (!monitorQuery.ok) {
     steps.push(failedCallStep("query_monitor", monitorQuery));
@@ -534,7 +472,7 @@ async function runSelftest(env: WorkerEnv, notionToken: string): Promise<Respons
 
   const episodeQuery = await notionRequest(
     `/v1/data_sources/${encodeURIComponent(env.NOTION_EPISODE_DS_ID)}/query`,
-    { method: "POST", body: JSON.stringify({ page_size: 1 }) },
+    { method: "POST", body: notionJsonBody({ page_size: 1 }) },
   );
   if (!episodeQuery.ok) {
     steps.push(failedCallStep("query_episode", episodeQuery));
@@ -558,25 +496,29 @@ async function runSelftest(env: WorkerEnv, notionToken: string): Promise<Respons
   });
 
   const testPageTitle = `[连通性测试] ${new Date().toISOString()}`;
-  const createPage = await notionRequest("/v1/pages", {
-    method: "POST",
-    body: JSON.stringify({
-      parent: {
-        type: "data_source_id",
-        data_source_id: env.NOTION_EPISODE_DS_ID,
-      },
-      properties: {
-        [titlePropertyName]: {
-          title: [
-            {
-              type: "text",
-              text: { content: testPageTitle },
-            },
-          ],
+  const createPage = await notionRequest(
+    "/v1/pages",
+    {
+      method: "POST",
+      body: notionJsonBody({
+        parent: {
+          type: "data_source_id",
+          data_source_id: env.NOTION_EPISODE_DS_ID,
         },
-      },
-    }),
-  });
+        properties: {
+          [titlePropertyName]: {
+            title: [
+              {
+                type: "text",
+                text: { content: testPageTitle },
+              },
+            ],
+          },
+        },
+      }),
+    },
+    false,
+  );
   if (!createPage.ok) {
     steps.push(failedCallStep("create_test_page", createPage));
     return selftestResponse(env, steps, 502);
@@ -600,7 +542,7 @@ async function runSelftest(env: WorkerEnv, notionToken: string): Promise<Respons
 
   const trashPage = await notionRequest(`/v1/pages/${encodeURIComponent(testPageId)}`, {
     method: "PATCH",
-    body: JSON.stringify({ in_trash: true }),
+    body: notionJsonBody({ in_trash: true }),
   });
   if (!trashPage.ok) {
     steps.push(failedCallStep("trash_test_page", trashPage));
@@ -625,11 +567,14 @@ async function runSelftest(env: WorkerEnv, notionToken: string): Promise<Respons
   return selftestResponse(env, steps, 200);
 }
 
-async function handleScheduled(controller: ScheduledController, env: WorkerEnv): Promise<void> {
-  const runId = stableRunId(controller);
-  const scheduledAt = new Date(controller.scheduledTime).toISOString();
+async function handleProducer(
+  input: { runId: string; triggerName: string; scheduledTime: number },
+  env: WorkerEnv,
+): Promise<void> {
+  const runId = input.runId;
+  const scheduledAt = new Date(input.scheduledTime).toISOString();
   const previousRunWindowStart = new Date(
-    controller.scheduledTime - PREVIOUS_RUN_WINDOW_MS,
+    input.scheduledTime - PREVIOUS_RUN_WINDOW_MS,
   ).toISOString();
   const startedAt = new Date().toISOString();
 
@@ -645,7 +590,7 @@ async function handleScheduled(controller: ScheduledController, env: WorkerEnv):
       ) VALUES (?, ?, ?, ?, 'creating', ?)
       ON CONFLICT(run_id) DO NOTHING`,
     )
-      .bind(runId, controller.cron, scheduledAt, startedAt, startedAt)
+      .bind(runId, input.triggerName, scheduledAt, startedAt, startedAt)
       .run();
 
     if (insert.meta.changes === 0) {
@@ -717,7 +662,10 @@ async function handleScheduled(controller: ScheduledController, env: WorkerEnv):
           throw new Error("catalog_notion_token_missing");
         }
 
-        const catalog = await loadPodcastCatalog(env.NOTION_TOKEN, env.NOTION_MONITOR_DS_ID);
+        const catalog = await loadPodcastCatalog(
+          createNotionClient(env.NOTION_TOKEN),
+          env.NOTION_MONITOR_DS_ID,
+        );
         for (const [errorCode, issueCount] of Object.entries(catalog.issue_counts)) {
           if (issueCount !== undefined && issueCount > 0) {
             writeLog({
@@ -757,7 +705,7 @@ async function handleScheduled(controller: ScheduledController, env: WorkerEnv):
         }
 
         const windowStart = new Date(
-          controller.scheduledTime - env.RSS_WINDOW_HOURS * 60 * 60 * 1_000,
+          input.scheduledTime - env.RSS_WINDOW_HOURS * 60 * 60 * 1_000,
         ).toISOString();
         const messages = catalog.feeds.map<FeedTaskMessage>((feed) => ({
           schema_version: FEED_TASK_SCHEMA_VERSION,
@@ -898,6 +846,17 @@ async function handleScheduled(controller: ScheduledController, env: WorkerEnv):
   }
 }
 
+async function handleScheduled(controller: ScheduledController, env: WorkerEnv): Promise<void> {
+  await handleProducer(
+    {
+      runId: stableRunId(controller),
+      triggerName: controller.cron,
+      scheduledTime: controller.scheduledTime,
+    },
+    env,
+  );
+}
+
 async function markRunProcessing(runId: string, env: WorkerEnv): Promise<void> {
   const now = new Date().toISOString();
   await env.DB.prepare(
@@ -943,6 +902,7 @@ async function markTaskRetrying(
 async function finalizeTaskSucceeded(
   body: FeedTaskMessage,
   result: Awaited<ReturnType<typeof fetchAndParseFeed>>,
+  diff: DryRunDiff,
   env: WorkerEnv,
 ): Promise<boolean> {
   const finishedAt = new Date().toISOString();
@@ -955,7 +915,10 @@ async function finalizeTaskSucceeded(
           downloaded_bytes = ?,
           parsed_item_count = ?,
           window_item_count = ?,
-          new_episode_count = 0,
+          new_episode_count = ?,
+          will_write_count = ?,
+          already_exists_count = ?,
+          dedup_failed_count = ?,
           notion_write_count = 0,
           parent_update_count = 0,
           error_code = NULL,
@@ -969,12 +932,17 @@ async function finalizeTaskSucceeded(
       result.downloaded_bytes,
       result.parsed_item_count,
       result.window_item_count,
+      diff.will_write,
+      diff.will_write,
+      diff.already_exists,
+      diff.dedup_failed,
       body.task_id,
       body.run_id,
     ),
     env.DB.prepare(
       `UPDATE runs
       SET succeeded_feed_count = succeeded_feed_count + 1,
+          new_episode_count = new_episode_count + ?,
           status = CASE
             WHEN succeeded_feed_count + failed_feed_count + 1 >= unique_feed_count
               THEN CASE WHEN failed_feed_count = 0 THEN 'succeeded' ELSE 'partial' END
@@ -1001,9 +969,39 @@ async function finalizeTaskSucceeded(
             AND status = 'succeeded'
             AND finished_at = ?
         )`,
-    ).bind(finishedAt, finishedAt, body.run_id, body.task_id, body.run_id, finishedAt),
+    ).bind(
+      diff.will_write,
+      finishedAt,
+      finishedAt,
+      body.run_id,
+      body.task_id,
+      body.run_id,
+      finishedAt,
+    ),
   ]);
   return (results[0]?.meta.changes ?? 0) > 0;
+}
+
+function toNotionFeedError(error: unknown): FeedPipelineError | null {
+  if (error instanceof NotionPayloadError) {
+    return new FeedPipelineError("notion_payload_invalid");
+  }
+  if (!(error instanceof NotionDedupError)) {
+    return null;
+  }
+  switch (error.code) {
+    case "episode_schema_invalid":
+    case "episode_schema_dedup_key_missing":
+    case "episode_schema_dedup_key_ambiguous":
+    case "episode_schema_podcast_name_missing":
+    case "episode_schema_podcast_name_ambiguous":
+      return new FeedPipelineError(error.code, { httpStatus: error.httpStatus });
+    default:
+      return new FeedPipelineError("notion_dedup_query_failed", {
+        retryable: error.retryable,
+        httpStatus: error.httpStatus,
+      });
+  }
 }
 
 async function finalizeTaskFailed(
@@ -1178,9 +1176,13 @@ async function handleQueue(batch: MessageBatch<FeedTaskMessage>, env: WorkerEnv)
 
       try {
         if (!env.DRY_RUN) {
-          throw new FeedPipelineError("stage_2_notion_writes_disabled");
+          throw new FeedPipelineError("stage_3_notion_writes_disabled");
+        }
+        if (!env.NOTION_TOKEN) {
+          throw new FeedPipelineError("notion_token_missing");
         }
 
+        const softDeadlineAt = Date.now() + env.MESSAGE_SOFT_DEADLINE_MS;
         const result = await fetchAndParseFeed(
           body.feed_url,
           { start: body.window_start, end: body.window_end },
@@ -1189,10 +1191,17 @@ async function handleQueue(batch: MessageBatch<FeedTaskMessage>, env: WorkerEnv)
             maxRedirects: env.RSS_MAX_REDIRECTS,
             connectTimeoutMs: env.RSS_CONNECT_TIMEOUT_MS,
             totalTimeoutMs: env.RSS_TIMEOUT_MS,
-            softDeadlineAt: Date.now() + env.MESSAGE_SOFT_DEADLINE_MS,
+            softDeadlineAt,
           },
         );
-        if (!(await finalizeTaskSucceeded(body, result, env))) {
+        const diff = await buildDryRunDiff(
+          createNotionClient(env.NOTION_TOKEN, { softDeadlineAt }),
+          env.NOTION_EPISODE_DS_ID,
+          body.podcast_name,
+          result.items,
+          result.window_item_count,
+        );
+        if (!(await finalizeTaskSucceeded(body, result, diff, env))) {
           throw new Error("feed_task_not_finalized");
         }
 
@@ -1207,19 +1216,24 @@ async function handleQueue(batch: MessageBatch<FeedTaskMessage>, env: WorkerEnv)
           parsed_item_count: result.parsed_item_count,
           window_item_count: result.window_item_count,
           redirect_count: result.redirect_count,
+          will_write: diff.will_write,
+          already_exists: diff.already_exists,
+          dedup_failed: diff.dedup_failed,
         });
         message.ack();
       } catch (error) {
-        if (!(error instanceof FeedPipelineError)) {
+        const pipelineError =
+          error instanceof FeedPipelineError ? error : toNotionFeedError(error);
+        if (pipelineError === null) {
           throw error;
         }
 
-        if (error.retryable) {
-          await markTaskRetrying(body, error, env);
+        if (pipelineError.retryable) {
+          await markTaskRetrying(body, pipelineError, env);
           writeLog({
             level: "warn",
             event: "queue_task_retrying",
-            error_code: error.code,
+            error_code: pipelineError.code,
             run_id: body.run_id,
             task_id: body.task_id,
             status: "retrying",
@@ -1230,13 +1244,13 @@ async function handleQueue(batch: MessageBatch<FeedTaskMessage>, env: WorkerEnv)
           continue;
         }
 
-        if (!(await finalizeTaskFailed(body, error, env))) {
+        if (!(await finalizeTaskFailed(body, pipelineError, env))) {
           throw new Error("feed_task_not_finalized");
         }
         writeLog({
           level: "error",
           event: "queue_task_failed_deterministic",
-          error_code: error.code,
+          error_code: pipelineError.code,
           run_id: body.run_id,
           task_id: body.task_id,
           status: "failed",
@@ -1434,6 +1448,39 @@ async function runRssSelftest(request: Request, env: WorkerEnv): Promise<Respons
   }
 }
 
+async function runManualTrigger(env: WorkerEnv): Promise<Response> {
+  const scheduledTime = Date.now();
+  const runId = `manual-run:${scheduledTime}:${crypto.randomUUID()}`;
+  try {
+    await handleProducer(
+      { runId, triggerName: "manual-trigger", scheduledTime },
+      env,
+    );
+    const status = await getRunStatus(runId, env);
+    if (status === null) {
+      throw new Error("manual_run_missing");
+    }
+    if (status === "skipped_previous_run_active") {
+      return json(
+        {
+          ok: false,
+          error: "previous_run_active",
+          run_id: runId,
+          status,
+        },
+        409,
+      );
+    }
+    return json({ ok: true, dry_run: true, run_id: runId, status }, 202);
+  } catch (error) {
+    const errorCode =
+      error instanceof Error && /^[a-z0-9_]+$/.test(error.message)
+        ? error.message
+        : "manual_run_failed";
+    return json({ ok: false, error: errorCode, run_id: runId }, 503);
+  }
+}
+
 export default {
   async fetch(request: Request, env: WorkerEnv): Promise<Response> {
     const url = new URL(request.url);
@@ -1478,6 +1525,25 @@ export default {
         return json({ ok: false, error: "unauthorized" }, 401);
       }
       return runRssSelftest(request, env);
+    }
+
+    if (url.pathname === "/trigger-run") {
+      if (request.method !== "POST") {
+        return json({ ok: false, error: "method_not_allowed" }, 405, { Allow: "POST" });
+      }
+      if (!env.MANUAL_TRIGGER_TOKEN) {
+        return json({ ok: false, error: "service_not_configured" }, 503);
+      }
+      if (!(await isAuthorized(request, env.MANUAL_TRIGGER_TOKEN))) {
+        return json({ ok: false, error: "unauthorized" }, 401);
+      }
+      if (!env.DRY_RUN) {
+        return json({ ok: false, error: "dry_run_required" }, 409);
+      }
+      if (!env.NOTION_TOKEN) {
+        return json({ ok: false, error: "service_not_configured" }, 503);
+      }
+      return runManualTrigger(env);
     }
 
     return json({ ok: false, error: "not_found" }, 404);

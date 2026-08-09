@@ -3,7 +3,11 @@ import { gzip } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { queueRetryDelaySeconds } from "../src/index";
-import { createDedupKey } from "../src/rss/dedup";
+import {
+  createDedupKey,
+  DEDUP_KEY_MAX_CHARACTERS,
+  sha256Hex,
+} from "../src/rss/dedup";
 import { FeedPipelineError } from "../src/rss/errors";
 import { fetchAndParseFeed } from "../src/rss/fetch";
 import { normalizeAndValidateFeedUrl } from "../src/rss/url";
@@ -313,8 +317,8 @@ describe("dedupKey normalization and precedence", () => {
       publishedAt: null,
     });
     expect(first).toEqual(same);
-    expect(differentCase?.key).not.toBe(first?.key);
-    expect(first?.source).toBe("guid");
+    expect(first).toEqual({ source: "guid", key: "guid:Episode-ID" });
+    expect(differentCase).toEqual({ source: "guid", key: "guid:episode-id" });
   });
 
   it("normalizes URL scheme/host and fragment but preserves path/query case", async () => {
@@ -340,8 +344,28 @@ describe("dedupKey normalization and precedence", () => {
       publishedAt: null,
     });
     expect(first).toEqual(same);
-    expect(differentPathCase?.key).not.toBe(first?.key);
-    expect(first?.source).toBe("link");
+    expect(first).toEqual({
+      source: "link",
+      key: "link:https://example.com/Episode?ID=AbC",
+    });
+    expect(differentPathCase).toEqual({
+      source: "link",
+      key: "link:https://example.com/episode?ID=AbC",
+    });
+  });
+
+  it("uses the normalized enclosure URL as a plaintext media key", async () => {
+    const result = await createDedupKey({
+      guid: null,
+      link: null,
+      mediaUrl: " HTTPS://CDN.EXAMPLE.COM:443/audio.mp3#player ",
+      title: null,
+      publishedAt: null,
+    });
+    expect(result).toEqual({
+      source: "media",
+      key: "media:https://cdn.example.com/audio.mp3",
+    });
   });
 
   it("falls back to normalized title plus canonical publication time", async () => {
@@ -360,7 +384,38 @@ describe("dedupKey normalization and precedence", () => {
       publishedAt: "2026-08-08T20:00:00.000Z",
     });
     expect(first).toEqual(same);
-    expect(first?.source).toBe("title_date");
+    expect(first).toEqual({
+      source: "title_date",
+      key: "title_date:A Podcast Episode\n2026-08-08T20:00:00.000Z",
+    });
+  });
+
+  it("keeps a long plaintext prefix and hashes only the truncated overflow", async () => {
+    const boundaryGuid = "b".repeat(1_895);
+    const boundary = await createDedupKey({
+      guid: boundaryGuid,
+      link: null,
+      mediaUrl: null,
+      title: null,
+      publishedAt: null,
+    });
+    expect(boundary?.key).toBe(`guid:${boundaryGuid}`);
+    expect(Array.from(boundary!.key)).toHaveLength(DEDUP_KEY_MAX_CHARACTERS);
+
+    const normalizedGuid = "x".repeat(1_896);
+    const overflow = normalizedGuid.slice(1_800);
+    const result = await createDedupKey({
+      guid: normalizedGuid,
+      link: null,
+      mediaUrl: null,
+      title: null,
+      publishedAt: null,
+    });
+    expect(result).toEqual({
+      source: "guid",
+      key: `guid:${"x".repeat(1_800)}#sha256:${await sha256Hex(overflow)}`,
+    });
+    expect(Array.from(result!.key).length).toBeLessThanOrEqual(DEDUP_KEY_MAX_CHARACTERS);
   });
 });
 

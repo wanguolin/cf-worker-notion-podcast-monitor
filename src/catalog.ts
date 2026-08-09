@@ -1,10 +1,6 @@
 import { sha256Hex } from "./rss/dedup";
 import { normalizeAndValidateFeedUrl } from "./rss/url";
-
-const NOTION_API_BASE = "https://api.notion.com";
-const NOTION_VERSION = "2026-03-11";
-const NOTION_REQUEST_GAP_MS = 350;
-const NOTION_REQUEST_TIMEOUT_MS = 10_000;
+import { type NotionClient, notionJsonBody } from "./notion/client";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -130,43 +126,30 @@ function selectProperty(page: JsonRecord, name: string): string | null {
   return text === "" ? null : text;
 }
 
-async function queryCatalogPages(token: string, dataSourceId: string): Promise<JsonRecord[]> {
+async function queryCatalogPages(
+  client: NotionClient,
+  dataSourceId: string,
+): Promise<JsonRecord[]> {
   const pages: JsonRecord[] = [];
   let cursor: string | null = null;
-  let requestCount = 0;
 
   do {
-    if (requestCount > 0) {
-      await new Promise((resolve) => setTimeout(resolve, NOTION_REQUEST_GAP_MS));
-    }
-    requestCount += 1;
-
-    let response: Response;
-    try {
-      response = await fetch(
-        `${NOTION_API_BASE}/v1/data_sources/${encodeURIComponent(dataSourceId)}/query`,
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${token}`,
-            "Content-Type": "application/json",
-            "Notion-Version": NOTION_VERSION,
-          },
-          body: JSON.stringify({
-            page_size: 100,
-            ...(cursor === null ? {} : { start_cursor: cursor }),
-          }),
-          signal: AbortSignal.timeout(NOTION_REQUEST_TIMEOUT_MS),
-        },
-      );
-    } catch {
-      throw new CatalogPipelineError("catalog_notion_request_failed");
-    }
-
-    const data: unknown = await response.json().catch(() => null);
+    const response = await client.request(
+      `/v1/data_sources/${encodeURIComponent(dataSourceId)}/query`,
+      {
+        method: "POST",
+        body: notionJsonBody({
+          page_size: 100,
+          is_archived: false,
+          ...(cursor === null ? {} : { start_cursor: cursor }),
+        }),
+      },
+      { retry: true },
+    );
     if (!response.ok) {
       throw new CatalogPipelineError("catalog_notion_request_failed");
     }
+    const data = response.data;
     if (!isRecord(data) || !Array.isArray(data.results)) {
       throw new CatalogPipelineError("catalog_invalid_response");
     }
@@ -190,10 +173,10 @@ async function queryCatalogPages(token: string, dataSourceId: string): Promise<J
 }
 
 export async function loadPodcastCatalog(
-  token: string,
+  client: NotionClient,
   dataSourceId: string,
 ): Promise<CatalogSnapshot> {
-  const pages = await queryCatalogPages(token, dataSourceId);
+  const pages = await queryCatalogPages(client, dataSourceId);
   const issues: Partial<Record<CatalogIssueCode, number>> = {};
   const activePages = pages.filter((page) => page.archived !== true && page.in_trash !== true);
   const grouped = new Map<

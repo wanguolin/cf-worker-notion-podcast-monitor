@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { loadPodcastCatalog } from "../src/catalog";
+import { createNotionClient } from "../src/notion/client";
 
 function page(
   id: string,
@@ -68,7 +69,10 @@ describe("Notion catalog pagination and feed grouping", () => {
       .mockResolvedValueOnce(Response.json(secondPage));
     vi.stubGlobal("fetch", fetchMock);
 
-    const snapshot = await loadPodcastCatalog("test-token", "test-data-source");
+    const snapshot = await loadPodcastCatalog(
+      createNotionClient("test-token", { fetchImpl: fetchMock, requestGapMs: 0 }),
+      "test-data-source",
+    );
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(snapshot.catalog_row_count).toBe(3);
     expect(snapshot.issue_counts.catalog_rss_empty).toBe(1);

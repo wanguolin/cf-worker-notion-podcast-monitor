@@ -15,6 +15,9 @@ export type DedupResult = {
   source: DedupSource;
 };
 
+export const DEDUP_KEY_MAX_CHARACTERS = 1_900;
+const DEDUP_KEY_RETAINED_CHARACTERS = 1_800;
+
 export function normalizeOpaqueIdentifier(value: string): string {
   return value.trim().replace(/\s+/g, " ");
 }
@@ -35,20 +38,32 @@ export async function sha256Hex(value: string): Promise<string> {
   );
 }
 
+async function boundedDedupKey(prefix: DedupSource, normalizedValue: string): Promise<string> {
+  const key = `${prefix}:${normalizedValue}`;
+  if (Array.from(key).length <= DEDUP_KEY_MAX_CHARACTERS) {
+    return key;
+  }
+
+  const characters = Array.from(normalizedValue);
+  const retained = characters.slice(0, DEDUP_KEY_RETAINED_CHARACTERS).join("");
+  const overflow = characters.slice(DEDUP_KEY_RETAINED_CHARACTERS).join("");
+  return `${prefix}:${retained}#sha256:${await sha256Hex(overflow)}`;
+}
+
 export async function createDedupKey(input: DedupInput): Promise<DedupResult | null> {
   const guid = input.guid === null ? "" : normalizeOpaqueIdentifier(input.guid);
   if (guid !== "") {
-    return { source: "guid", key: `guid:${await sha256Hex(guid)}` };
+    return { source: "guid", key: await boundedDedupKey("guid", guid) };
   }
 
   const link = input.link === null ? null : normalizeUrlForDedup(input.link);
   if (link !== null) {
-    return { source: "link", key: `link:${await sha256Hex(link)}` };
+    return { source: "link", key: await boundedDedupKey("link", link) };
   }
 
   const media = input.mediaUrl === null ? null : normalizeUrlForDedup(input.mediaUrl);
   if (media !== null) {
-    return { source: "media", key: `media:${await sha256Hex(media)}` };
+    return { source: "media", key: await boundedDedupKey("media", media) };
   }
 
   const title = input.title === null ? "" : normalizeTitle(input.title);
@@ -59,6 +74,6 @@ export async function createDedupKey(input: DedupInput): Promise<DedupResult | n
 
   return {
     source: "title_date",
-    key: `title_date:${await sha256Hex(`${title}\n${publishedAt}`)}`,
+    key: await boundedDedupKey("title_date", `${title}\n${publishedAt}`),
   };
 }
