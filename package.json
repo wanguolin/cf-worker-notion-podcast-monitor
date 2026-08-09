@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "wrangler dev --env finance-production",
     "deploy": "wrangler deploy --env finance-production",
+    "trigger": "node scripts/trigger.mjs",
     "test": "vitest run --maxWorkers=1",
     "typecheck": "tsc --noEmit"
   },

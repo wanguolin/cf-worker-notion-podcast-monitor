@@ -14,13 +14,15 @@ npm test                          # vitest 全量
 npx vitest run test/rss-pipeline.test.ts   # 单个测试文件
 npm run dev                       # wrangler dev --env finance-production（--test-scheduled 可触发 scheduled）
 npm run deploy                    # wrangler deploy --env finance-production
+npm run trigger                   # 读取 .env 的 MANUAL_TRIGGER_TOKEN 手动补跑
 npx wrangler types                # 改 wrangler.jsonc 后必须重新生成 worker-configuration.d.ts
 npx wrangler d1 migrations apply podcast-monitor-finance-production --local --env finance-production
 npx wrangler d1 migrations apply podcast-monitor-finance-production --remote --env finance-production  # 部署含新迁移的版本前必须先执行
+# https://cf-worker-notion-podcast-monitor-finance-production.polymaster.workers.dev/logs  # 公开只读网页观测，日志滚动保留 7 天
 ```
 
 - 唯一环境是 `env.finance-production`（用户决定不设 staging）；Worker 名 `cf-worker-notion-podcast-monitor-finance-production`。
-- Secrets（`NOTION_TOKEN`、`MANUAL_TRIGGER_TOKEN`）用 `wrangler secret put <NAME> --env finance-production` 设置，绝不落盘进仓库。本地 `.trigger-token`（gitignored）保存手动端点的 Bearer 口令。
+- Secrets（`NOTION_TOKEN`、`MANUAL_TRIGGER_TOKEN`）用 `wrangler secret put <NAME> --env finance-production` 设置，绝不落盘进仓库。本地 `.env`（gitignored）保存 `MANUAL_TRIGGER_TOKEN`，供 `npm run trigger` 使用。
 - 部署后新版本有约 1 分钟传播延迟：紧接着调用端点可能落在旧实例，判定结果前先重试确认。
 
 ## 架构
@@ -54,3 +56,4 @@ queue() → Consumer：单 Feed 串行——流式下载解析 → 26h 窗口 �
 - 生产 Cron 为 `0 16 * * *`（每日 00:00 Asia/Shanghai）；DRY_RUN=false、CANARY_FEED_HASHES 为空即全量真实写入。回滚开关：置 DRY_RUN=true 重新部署即停写。
 - 大体积测试 fixture 由 `test/fixtures/generate-feed.ts` 生成，不提交大文件进 git。
 - 日志为 JSON 单行结构化格式，含稳定 error_code；绝不输出 token、Authorization 或完整 Feed URL。
+- `/logs` 与 `/logs.json` 是公开只读端点；渲染与 JSON 内容禁止出现 token、Authorization、完整 Feed URL 或 `error_summary` 原文。

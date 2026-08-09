@@ -28,6 +28,7 @@ import { sha256Hex } from "./rss/dedup";
 import { FeedPipelineError } from "./rss/errors";
 import { fetchAndParseFeed } from "./rss/fetch";
 import { normalizeAndValidateFeedUrl } from "./rss/url";
+import { logsResponse, pruneOldRuns } from "./observability";
 
 const FEED_TASK_SCHEMA_VERSION = 1;
 const PROCESSING_LEASE_MS = 15 * 60 * 1_000;
@@ -45,7 +46,7 @@ type Secrets = {
   readonly MANUAL_TRIGGER_TOKEN?: string;
 };
 
-type WorkerEnv = Cloudflare.FinanceProductionEnv & Secrets;
+export type WorkerEnv = Cloudflare.FinanceProductionEnv & Secrets;
 
 export type FeedTaskMessage = {
   schema_version: typeof FEED_TASK_SCHEMA_VERSION;
@@ -219,6 +220,31 @@ export function queueRetryDelaySeconds(attempts: number): number {
 
 function taskIdFor(runId: string, feedUrlHash: string): string {
   return `${runId}:feed:${feedUrlHash}`;
+}
+
+export function prepareFeedTaskInsert(
+  database: D1Database,
+  body: FeedTaskMessage,
+): D1PreparedStatement {
+  return database.prepare(
+    `INSERT INTO feed_tasks (
+      task_id,
+      run_id,
+      feed_url_hash,
+      podcast_name,
+      feed_host,
+      status,
+      message_body_json
+    ) VALUES (?, ?, ?, ?, ?, 'pending_enqueue', ?)
+    ON CONFLICT(run_id, feed_url_hash) DO NOTHING`,
+  ).bind(
+    body.task_id,
+    body.run_id,
+    body.feed_url_hash,
+    body.podcast_name,
+    new URL(body.feed_url).hostname,
+    JSON.stringify(body),
+  );
 }
 
 function parseOutboxMessage(row: OutboxRow): FeedTaskMessage {
@@ -687,6 +713,7 @@ async function handleProducer(
     }
 
     try {
+      await pruneOldRuns(env.DB);
       let outbox = await getRunOutbox(runId, env);
       if (outbox.length === 0) {
         if (!env.NOTION_TOKEN) {
@@ -754,18 +781,7 @@ async function handleProducer(
         }));
         const now = new Date().toISOString();
         await env.DB.batch([
-          ...messages.map((body) =>
-            env.DB.prepare(
-              `INSERT INTO feed_tasks (
-                task_id,
-                run_id,
-                feed_url_hash,
-                status,
-                message_body_json
-              ) VALUES (?, ?, ?, 'pending_enqueue', ?)
-              ON CONFLICT(run_id, feed_url_hash) DO NOTHING`,
-            ).bind(body.task_id, runId, body.feed_url_hash, JSON.stringify(body)),
-          ),
+          ...messages.map((body) => prepareFeedTaskInsert(env.DB, body)),
           env.DB.prepare(
             `UPDATE runs
             SET catalog_row_count = ?,
@@ -1586,11 +1602,7 @@ async function runRssSelftest(request: Request, env: WorkerEnv): Promise<Respons
           catalog_row_count, unique_feed_count, heartbeat_at
         ) VALUES (?, 'manual', ?, ?, 'creating', 1, 1, ?)`,
       ).bind(runId, now, now, now),
-      env.DB.prepare(
-        `INSERT INTO feed_tasks (
-          task_id, run_id, feed_url_hash, status, message_body_json
-        ) VALUES (?, ?, ?, 'pending_enqueue', ?)`,
-      ).bind(taskId, runId, feedUrlHash, JSON.stringify(taskBody)),
+      prepareFeedTaskInsert(env.DB, taskBody),
     ]);
     try {
       await env.FEED_TASKS_QUEUE.send(taskBody, { contentType: "json" });
@@ -1794,6 +1806,16 @@ export default {
       }
 
       return json({ ok: true, env: env.ENV_NAME });
+    }
+
+    if (url.pathname === "/logs" || url.pathname === "/logs.json") {
+      if (request.method !== "GET") {
+        return json({ ok: false, error: "method_not_allowed" }, 405, {
+          Allow: "GET",
+          "X-Robots-Tag": "noindex",
+        });
+      }
+      return logsResponse(env.DB, url.pathname === "/logs" ? "html" : "json");
     }
 
     if (url.pathname === "/selftest") {

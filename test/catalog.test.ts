@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { loadPodcastCatalog } from "../src/catalog";
+import { CatalogPipelineError, loadPodcastCatalog } from "../src/catalog";
 import { createNotionClient } from "../src/notion/client";
 
 function page(
@@ -91,5 +91,27 @@ describe("Notion catalog pagination and feed grouping", () => {
       { page_id: "parent-a", podcast_name: "Masters in Business" },
       { page_id: "parent-b", podcast_name: "Masters in Business" },
     ]);
+  });
+
+  it("rejects different podcast names mapped to the same normalized feed", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      Response.json({
+        object: "list",
+        results: [
+          page("parent-a", "Podcast A", "https://feeds.example.com/show.xml", "美股投资"),
+          page("parent-b", "Podcast B", "https://feeds.example.com/show.xml", "大科技与AI"),
+        ],
+        has_more: false,
+        next_cursor: null,
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      loadPodcastCatalog(
+        createNotionClient("test-token", { fetchImpl: fetchMock, requestGapMs: 0 }),
+        "test-data-source",
+      ),
+    ).rejects.toEqual(new CatalogPipelineError("catalog_feed_mapping_conflict"));
   });
 });
