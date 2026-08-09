@@ -2,7 +2,7 @@
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "cf-worker-notion-podcast-monitor",
   "main": "src/index.ts",
-  "compatibility_date": "2026-08-09",
+  "compatibility_date": "2026-08-08",
   "compatibility_flags": ["nodejs_compat"],
 
   // Secrets are environment-specific and must never be stored here:
@@ -16,7 +16,36 @@
         "NOTION_MONITOR_DS_ID": "6770eb15-6002-4bd9-8791-53f8fc968cab",
         "NOTION_EPISODE_DS_ID": "c6518896-0a17-43bb-8f95-b88933d211cb",
         "DRY_RUN": true
-      }
+      },
+      "limits": {
+        "cpu_ms": 300000
+      },
+      "queues": {
+        "producers": [
+          {
+            "binding": "FEED_TASKS_QUEUE",
+            "queue": "podcast-monitor-feed-tasks-finance-production"
+          }
+        ],
+        "consumers": [
+          {
+            "queue": "podcast-monitor-feed-tasks-finance-production",
+            "max_batch_size": 1,
+            "max_batch_timeout": 0,
+            "max_retries": 5,
+            "dead_letter_queue": "podcast-monitor-dlq-finance-production",
+            "max_concurrency": 1
+          }
+        ]
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "podcast-monitor-finance-production",
+          "database_id": "38f5ee58-edbb-4108-b89b-f7cd64bd51e0",
+          "migrations_dir": "migrations"
+        }
+      ]
     }
   }
 }

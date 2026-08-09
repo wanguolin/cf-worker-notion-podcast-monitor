@@ -2,6 +2,11 @@ const NOTION_API_BASE = "https://api.notion.com";
 const NOTION_VERSION = "2026-03-11";
 const NOTION_REQUEST_GAP_MS = 350;
 const NOTION_REQUEST_TIMEOUT_MS = 10_000;
+const FEED_TASK_SCHEMA_VERSION = 1;
+const PROCESSING_LEASE_MS = 15 * 60 * 1_000;
+const QUEUE_RETRY_DELAY_SECONDS = 60;
+const STAGE_ONE_NOT_IMPLEMENTED = "stage_1_consumer_not_implemented";
+const PREVIOUS_RUN_WINDOW_MS = 24 * 60 * 60 * 1_000;
 
 type Secrets = {
   readonly NOTION_TOKEN?: string;
@@ -9,6 +14,35 @@ type Secrets = {
 };
 
 type WorkerEnv = Cloudflare.FinanceProductionEnv & Secrets;
+
+type FeedTaskMessage = {
+  schema_version: typeof FEED_TASK_SCHEMA_VERSION;
+  run_id: string;
+  task_id: string;
+  feed_url: string;
+  feed_url_hash: string;
+  podcast_name: string;
+  categories: string[];
+  language: string | null;
+  parent_page_ids: string[];
+  window_start: string;
+  window_end: string;
+  content_fingerprint: string;
+};
+
+type TaskStatusRow = {
+  status: string;
+};
+
+type StructuredLog = {
+  level: "info" | "warn" | "error";
+  event: string;
+  error_code?: string;
+  run_id?: string;
+  task_id?: string;
+  status?: string;
+  attempts?: number;
+};
 
 type JsonRecord = Record<string, unknown>;
 
@@ -42,6 +76,52 @@ function sleep(milliseconds: number): Promise<void> {
 
 function isRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function isFeedTaskMessage(value: unknown): value is FeedTaskMessage {
+  return (
+    isRecord(value) &&
+    value.schema_version === FEED_TASK_SCHEMA_VERSION &&
+    typeof value.run_id === "string" &&
+    typeof value.task_id === "string" &&
+    typeof value.feed_url === "string" &&
+    typeof value.feed_url_hash === "string" &&
+    typeof value.podcast_name === "string" &&
+    isStringArray(value.categories) &&
+    (typeof value.language === "string" || value.language === null) &&
+    isStringArray(value.parent_page_ids) &&
+    typeof value.window_start === "string" &&
+    typeof value.window_end === "string" &&
+    typeof value.content_fingerprint === "string"
+  );
+}
+
+function isTerminalTaskStatus(status: string): boolean {
+  return status === "succeeded" || status === "failed" || status === "dead_lettered";
+}
+
+function writeLog(entry: StructuredLog): void {
+  const line = JSON.stringify(entry);
+
+  if (entry.level === "error") {
+    console.error(line);
+    return;
+  }
+
+  if (entry.level === "warn") {
+    console.warn(line);
+    return;
+  }
+
+  console.log(line);
+}
+
+function stableRunId(controller: ScheduledController): string {
+  return `cron:${controller.cron}:scheduled:${controller.scheduledTime}`;
 }
 
 function getProperties(value: unknown): JsonRecord | null {
@@ -383,6 +463,325 @@ async function runSelftest(env: WorkerEnv, notionToken: string): Promise<Respons
   return selftestResponse(env, steps, 200);
 }
 
+async function handleScheduled(controller: ScheduledController, env: WorkerEnv): Promise<void> {
+  const runId = stableRunId(controller);
+  const scheduledAt = new Date(controller.scheduledTime).toISOString();
+  const previousRunWindowStart = new Date(
+    controller.scheduledTime - PREVIOUS_RUN_WINDOW_MS,
+  ).toISOString();
+  const startedAt = new Date().toISOString();
+
+  try {
+    const insert = await env.DB.prepare(
+      `INSERT INTO runs (
+        run_id,
+        cron,
+        scheduled_at,
+        started_at,
+        status,
+        heartbeat_at
+      ) VALUES (?, ?, ?, ?, 'creating', ?)
+      ON CONFLICT(run_id) DO NOTHING`,
+    )
+      .bind(runId, controller.cron, scheduledAt, startedAt, startedAt)
+      .run();
+
+    if (insert.meta.changes === 0) {
+      writeLog({
+        level: "info",
+        event: "scheduled_run_already_exists",
+        error_code: "duplicate_run",
+        run_id: runId,
+      });
+    }
+
+    const checkedAt = new Date().toISOString();
+    const skipped = await env.DB.prepare(
+      `UPDATE runs
+      SET status = 'skipped_previous_run_active',
+          finished_at = ?,
+          heartbeat_at = ?,
+          error_summary = 'previous_run_active'
+      WHERE run_id = ?
+        AND status = 'creating'
+        AND EXISTS (
+          SELECT 1
+          FROM runs AS previous
+          WHERE previous.run_id <> ?
+            AND previous.scheduled_at >= ?
+            AND previous.scheduled_at < ?
+            AND previous.status IN ('creating', 'queued', 'running')
+        )`,
+    )
+      .bind(checkedAt, checkedAt, runId, runId, previousRunWindowStart, scheduledAt)
+      .run();
+
+    if (skipped.meta.changes > 0) {
+      writeLog({
+        level: "error",
+        event: "scheduled_run_skipped",
+        error_code: "previous_run_active",
+        run_id: runId,
+        status: "skipped_previous_run_active",
+      });
+      return;
+    }
+
+    const finishedAt = new Date().toISOString();
+    const completed = await env.DB.prepare(
+      `UPDATE runs
+      SET status = 'succeeded',
+          finished_at = ?,
+          heartbeat_at = ?,
+          error_summary = NULL
+      WHERE run_id = ?
+        AND status = 'creating'`,
+    )
+      .bind(finishedAt, finishedAt, runId)
+      .run();
+
+    if (completed.meta.changes > 0) {
+      writeLog({
+        level: "info",
+        event: "scheduled_empty_run_succeeded",
+        run_id: runId,
+        status: "succeeded",
+      });
+      return;
+    }
+
+    const current = await env.DB.prepare(
+      `SELECT status
+      FROM runs
+      WHERE run_id = ?`,
+    )
+      .bind(runId)
+      .first<TaskStatusRow>();
+
+    writeLog({
+      level: "info",
+      event: "scheduled_run_terminal",
+      run_id: runId,
+      ...(current === null ? {} : { status: current.status }),
+    });
+  } catch {
+    const failedAt = new Date().toISOString();
+
+    try {
+      await env.DB.prepare(
+        `UPDATE runs
+        SET status = 'failed',
+            finished_at = ?,
+            heartbeat_at = ?,
+            error_summary = 'scheduled_d1_error'
+        WHERE run_id = ?
+          AND status = 'creating'`,
+      )
+        .bind(failedAt, failedAt, runId)
+        .run();
+    } catch {
+      // The structured log below is the remaining failure signal if D1 is unavailable.
+    }
+
+    writeLog({
+      level: "error",
+      event: "scheduled_run_failed",
+      error_code: "scheduled_d1_error",
+      run_id: runId,
+      status: "failed",
+    });
+    throw new Error("scheduled_d1_error");
+  }
+}
+
+async function handleQueue(batch: MessageBatch<FeedTaskMessage>, env: WorkerEnv): Promise<void> {
+  for (const message of batch.messages) {
+    const body: unknown = message.body;
+
+    if (!isFeedTaskMessage(body)) {
+      writeLog({
+        level: "error",
+        event: "queue_message_rejected",
+        error_code: "invalid_queue_message",
+        attempts: message.attempts,
+      });
+      message.ack();
+      continue;
+    }
+
+    try {
+      const existing = await env.DB.prepare(
+        `SELECT status
+        FROM feed_tasks
+        WHERE task_id = ?
+          AND run_id = ?`,
+      )
+        .bind(body.task_id, body.run_id)
+        .first<TaskStatusRow>();
+
+      if (existing === null) {
+        writeLog({
+          level: "warn",
+          event: "queue_task_missing",
+          error_code: "feed_task_not_found",
+          run_id: body.run_id,
+          task_id: body.task_id,
+          attempts: message.attempts,
+        });
+        message.retry({ delaySeconds: QUEUE_RETRY_DELAY_SECONDS });
+        continue;
+      }
+
+      if (isTerminalTaskStatus(existing.status)) {
+        writeLog({
+          level: "info",
+          event: "queue_terminal_task_acked",
+          run_id: body.run_id,
+          task_id: body.task_id,
+          status: existing.status,
+          attempts: message.attempts,
+        });
+        message.ack();
+        continue;
+      }
+
+      const startedAt = new Date().toISOString();
+      const staleBefore = new Date(Date.now() - PROCESSING_LEASE_MS).toISOString();
+      const claimed = await env.DB.prepare(
+        `UPDATE feed_tasks
+        SET status = 'processing',
+            started_at = ?,
+            finished_at = NULL,
+            attempt_count = MAX(attempt_count, ?),
+            error_code = NULL,
+            error_summary = NULL
+        WHERE task_id = ?
+          AND run_id = ?
+          AND (
+            status IN ('pending_enqueue', 'queued', 'retrying')
+            OR (
+              status = 'processing'
+              AND (started_at IS NULL OR started_at < ?)
+            )
+          )`,
+      )
+        .bind(startedAt, message.attempts, body.task_id, body.run_id, staleBefore)
+        .run();
+
+      if (claimed.meta.changes === 0) {
+        const latest = await env.DB.prepare(
+          `SELECT status
+          FROM feed_tasks
+          WHERE task_id = ?
+            AND run_id = ?`,
+        )
+          .bind(body.task_id, body.run_id)
+          .first<TaskStatusRow>();
+
+        if (latest !== null && isTerminalTaskStatus(latest.status)) {
+          message.ack();
+          continue;
+        }
+
+        writeLog({
+          level: "warn",
+          event: "queue_task_claim_deferred",
+          error_code: "feed_task_not_claimed",
+          run_id: body.run_id,
+          task_id: body.task_id,
+          ...(latest === null ? {} : { status: latest.status }),
+          attempts: message.attempts,
+        });
+        message.retry({ delaySeconds: QUEUE_RETRY_DELAY_SECONDS });
+        continue;
+      }
+
+      const finishedAt = new Date().toISOString();
+      const finalizeResults = await env.DB.batch([
+        env.DB.prepare(
+          `UPDATE feed_tasks
+          SET status = 'failed',
+              finished_at = ?,
+              error_code = ?,
+              error_summary = 'RSS processing is intentionally disabled in stage 1'
+          WHERE task_id = ?
+            AND run_id = ?
+            AND status = 'processing'`,
+        ).bind(finishedAt, STAGE_ONE_NOT_IMPLEMENTED, body.task_id, body.run_id),
+        env.DB.prepare(
+          `UPDATE runs
+          SET failed_feed_count = failed_feed_count + 1,
+              status = CASE
+                WHEN succeeded_feed_count + failed_feed_count + 1 >= unique_feed_count
+                  THEN CASE WHEN succeeded_feed_count = 0 THEN 'failed' ELSE 'partial' END
+                ELSE 'running'
+              END,
+              finished_at = CASE
+                WHEN succeeded_feed_count + failed_feed_count + 1 >= unique_feed_count
+                  THEN ?
+                ELSE finished_at
+              END,
+              heartbeat_at = ?
+          WHERE run_id = ?
+            AND EXISTS (
+              SELECT 1
+              FROM feed_tasks
+              WHERE task_id = ?
+                AND run_id = ?
+                AND status = 'failed'
+                AND finished_at = ?
+                AND error_code = ?
+            )`,
+        ).bind(
+          finishedAt,
+          finishedAt,
+          body.run_id,
+          body.task_id,
+          body.run_id,
+          finishedAt,
+          STAGE_ONE_NOT_IMPLEMENTED,
+        ),
+      ]);
+
+      const finalizedTask = finalizeResults[0];
+
+      if (finalizedTask === undefined || finalizedTask.meta.changes === 0) {
+        writeLog({
+          level: "warn",
+          event: "queue_task_finalize_deferred",
+          error_code: "feed_task_not_finalized",
+          run_id: body.run_id,
+          task_id: body.task_id,
+          attempts: message.attempts,
+        });
+        message.retry({ delaySeconds: QUEUE_RETRY_DELAY_SECONDS });
+        continue;
+      }
+
+      writeLog({
+        level: "warn",
+        event: "queue_task_stage_one_stub",
+        error_code: STAGE_ONE_NOT_IMPLEMENTED,
+        run_id: body.run_id,
+        task_id: body.task_id,
+        status: "failed",
+        attempts: message.attempts,
+      });
+      message.ack();
+    } catch {
+      writeLog({
+        level: "error",
+        event: "queue_task_failed",
+        error_code: "queue_d1_error",
+        run_id: body.run_id,
+        task_id: body.task_id,
+        attempts: message.attempts,
+      });
+      message.retry({ delaySeconds: QUEUE_RETRY_DELAY_SECONDS });
+    }
+  }
+}
+
 export default {
   async fetch(request: Request, env: WorkerEnv): Promise<Response> {
     const url = new URL(request.url);
@@ -418,4 +817,10 @@ export default {
 
     return json({ ok: false, error: "not_found" }, 404);
   },
-} satisfies ExportedHandler<WorkerEnv>;
+  async scheduled(controller: ScheduledController, env: WorkerEnv): Promise<void> {
+    await handleScheduled(controller, env);
+  },
+  async queue(batch: MessageBatch<FeedTaskMessage>, env: WorkerEnv): Promise<void> {
+    await handleQueue(batch, env);
+  },
+} satisfies ExportedHandler<WorkerEnv, FeedTaskMessage>;
