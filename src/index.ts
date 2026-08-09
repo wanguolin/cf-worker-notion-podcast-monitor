@@ -1,4 +1,9 @@
-import { CatalogPipelineError, loadPodcastCatalog } from "./catalog";
+import {
+  CatalogPipelineError,
+  loadCatalogParentPages,
+  loadPodcastCatalog,
+} from "./catalog";
+import { shouldWriteFeed } from "./canary";
 import {
   createNotionClient,
   notionJsonBody,
@@ -6,6 +11,19 @@ import {
 } from "./notion/client";
 import { buildDryRunDiff, NotionDedupError, type DryRunDiff } from "./notion/dedup";
 import { NotionPayloadError } from "./notion/payload";
+import {
+  countTaskEpisodeWrites,
+  EpisodeWriteError,
+  writeEpisodes,
+} from "./notion/episodes";
+import {
+  cacheParentSyncBlock,
+  discoverParentSyncBlock,
+  formatShanghaiTimestamp,
+  ParentBlockError,
+  updateParentPagesSequentially,
+  updateParentSyncTime,
+} from "./notion/parent";
 import { sha256Hex } from "./rss/dedup";
 import { FeedPipelineError } from "./rss/errors";
 import { fetchAndParseFeed } from "./rss/fetch";
@@ -42,6 +60,7 @@ export type FeedTaskMessage = {
   window_start: string;
   window_end: string;
   content_fingerprint: string;
+  force_dry_run?: boolean;
 };
 
 type StatusRow = {
@@ -73,6 +92,10 @@ type StructuredLog = {
   will_write?: number;
   already_exists?: number;
   dedup_failed?: number;
+  notion_write_count?: number;
+  parent_update_count?: number;
+  description_truncated?: number;
+  write_enabled?: boolean;
 };
 
 type JsonRecord = Record<string, unknown>;
@@ -82,6 +105,12 @@ type StepResult = {
   ok: boolean;
   status: number;
   summary: string;
+};
+
+type TaskProcessingOutcome = DryRunDiff & {
+  description_truncated: number;
+  notion_write_count: number;
+  parent_update_count: number;
 };
 
 function json(data: unknown, status = 200, headers?: HeadersInit): Response {
@@ -153,7 +182,8 @@ function isFeedTaskMessage(value: unknown): value is FeedTaskMessage {
     isStringArray(value.parent_page_ids) &&
     typeof value.window_start === "string" &&
     typeof value.window_end === "string" &&
-    typeof value.content_fingerprint === "string"
+    typeof value.content_fingerprint === "string" &&
+    (value.force_dry_run === undefined || typeof value.force_dry_run === "boolean")
   );
 }
 
@@ -902,7 +932,7 @@ async function markTaskRetrying(
 async function finalizeTaskSucceeded(
   body: FeedTaskMessage,
   result: Awaited<ReturnType<typeof fetchAndParseFeed>>,
-  diff: DryRunDiff,
+  outcome: TaskProcessingOutcome,
   env: WorkerEnv,
 ): Promise<boolean> {
   const finishedAt = new Date().toISOString();
@@ -919,8 +949,9 @@ async function finalizeTaskSucceeded(
           will_write_count = ?,
           already_exists_count = ?,
           dedup_failed_count = ?,
-          notion_write_count = 0,
-          parent_update_count = 0,
+          notion_write_count = ?,
+          parent_update_count = ?,
+          description_truncated_count = ?,
           error_code = NULL,
           error_summary = NULL
       WHERE task_id = ?
@@ -932,10 +963,13 @@ async function finalizeTaskSucceeded(
       result.downloaded_bytes,
       result.parsed_item_count,
       result.window_item_count,
-      diff.will_write,
-      diff.will_write,
-      diff.already_exists,
-      diff.dedup_failed,
+      outcome.will_write,
+      outcome.will_write,
+      outcome.already_exists,
+      outcome.dedup_failed,
+      outcome.notion_write_count,
+      outcome.parent_update_count,
+      outcome.description_truncated,
       body.task_id,
       body.run_id,
     ),
@@ -943,6 +977,7 @@ async function finalizeTaskSucceeded(
       `UPDATE runs
       SET succeeded_feed_count = succeeded_feed_count + 1,
           new_episode_count = new_episode_count + ?,
+          parent_update_count = parent_update_count + ?,
           status = CASE
             WHEN succeeded_feed_count + failed_feed_count + 1 >= unique_feed_count
               THEN CASE WHEN failed_feed_count = 0 THEN 'succeeded' ELSE 'partial' END
@@ -970,7 +1005,8 @@ async function finalizeTaskSucceeded(
             AND finished_at = ?
         )`,
     ).bind(
-      diff.will_write,
+      outcome.notion_write_count,
+      outcome.parent_update_count,
       finishedAt,
       finishedAt,
       body.run_id,
@@ -987,6 +1023,18 @@ function toNotionFeedError(error: unknown): FeedPipelineError | null {
     return new FeedPipelineError("notion_payload_invalid");
   }
   if (!(error instanceof NotionDedupError)) {
+    if (error instanceof EpisodeWriteError) {
+      return new FeedPipelineError(error.code, {
+        retryable: error.retryable,
+        httpStatus: error.httpStatus,
+      });
+    }
+    if (error instanceof ParentBlockError) {
+      return new FeedPipelineError("parent_update_failed", {
+        retryable: true,
+        httpStatus: error.httpStatus,
+      });
+    }
     return null;
   }
   switch (error.code) {
@@ -1002,6 +1050,55 @@ function toNotionFeedError(error: unknown): FeedPipelineError | null {
         httpStatus: error.httpStatus,
       });
   }
+}
+
+type TaskWriteProgress = {
+  description_truncated_count: number;
+  notion_write_count: number;
+  parent_update_count: number;
+};
+
+async function loadTaskWriteProgress(
+  body: FeedTaskMessage,
+  env: WorkerEnv,
+): Promise<TaskWriteProgress> {
+  const row = await env.DB.prepare(
+    `SELECT notion_write_count, parent_update_count, description_truncated_count
+    FROM feed_tasks WHERE task_id = ? AND run_id = ?`,
+  )
+    .bind(body.task_id, body.run_id)
+    .first<TaskWriteProgress>();
+  return (
+    row ?? {
+      notion_write_count: 0,
+      parent_update_count: 0,
+      description_truncated_count: 0,
+    }
+  );
+}
+
+async function persistTaskWriteProgress(
+  body: FeedTaskMessage,
+  progress: TaskWriteProgress,
+  env: WorkerEnv,
+): Promise<void> {
+  await env.DB.prepare(
+    `UPDATE feed_tasks
+    SET notion_write_count = MAX(notion_write_count, ?),
+        parent_update_count = MAX(parent_update_count, ?),
+        description_truncated_count = MAX(description_truncated_count, ?),
+        new_episode_count = MAX(new_episode_count, ?)
+    WHERE task_id = ? AND run_id = ? AND status = 'processing'`,
+  )
+    .bind(
+      progress.notion_write_count,
+      progress.parent_update_count,
+      progress.description_truncated_count,
+      progress.notion_write_count,
+      body.task_id,
+      body.run_id,
+    )
+    .run();
 }
 
 async function finalizeTaskFailed(
@@ -1032,6 +1129,14 @@ async function finalizeTaskFailed(
     env.DB.prepare(
       `UPDATE runs
       SET failed_feed_count = failed_feed_count + 1,
+          new_episode_count = new_episode_count + COALESCE((
+            SELECT notion_write_count FROM feed_tasks
+            WHERE task_id = ? AND run_id = ?
+          ), 0),
+          parent_update_count = parent_update_count + COALESCE((
+            SELECT parent_update_count FROM feed_tasks
+            WHERE task_id = ? AND run_id = ?
+          ), 0),
           status = CASE
             WHEN succeeded_feed_count + failed_feed_count + 1 >= unique_feed_count
               THEN CASE WHEN succeeded_feed_count = 0 THEN 'failed' ELSE 'partial' END
@@ -1055,6 +1160,10 @@ async function finalizeTaskFailed(
             AND error_code = ?
         )`,
     ).bind(
+      body.task_id,
+      body.run_id,
+      body.task_id,
+      body.run_id,
       finishedAt,
       finishedAt,
       error.code,
@@ -1175,9 +1284,6 @@ async function handleQueue(batch: MessageBatch<FeedTaskMessage>, env: WorkerEnv)
       await markRunProcessing(body.run_id, env);
 
       try {
-        if (!env.DRY_RUN) {
-          throw new FeedPipelineError("stage_3_notion_writes_disabled");
-        }
         if (!env.NOTION_TOKEN) {
           throw new FeedPipelineError("notion_token_missing");
         }
@@ -1194,20 +1300,113 @@ async function handleQueue(batch: MessageBatch<FeedTaskMessage>, env: WorkerEnv)
             softDeadlineAt,
           },
         );
-        const diff = await buildDryRunDiff(
-          createNotionClient(env.NOTION_TOKEN, { softDeadlineAt }),
-          env.NOTION_EPISODE_DS_ID,
-          body.podcast_name,
-          result.items,
-          result.window_item_count,
-        );
-        if (!(await finalizeTaskSucceeded(body, result, diff, env))) {
+        const notionClient = createNotionClient(env.NOTION_TOKEN, { softDeadlineAt });
+        const writeEnabled = shouldWriteFeed(
+          Boolean(env.DRY_RUN),
+          env.CANARY_FEED_HASHES,
+          body.feed_url_hash,
+        ) && body.force_dry_run !== true;
+        let outcome: TaskProcessingOutcome;
+        if (writeEnabled) {
+          const writes = await writeEpisodes({
+            candidates: result.items,
+            categories: body.categories,
+            client: notionClient,
+            database: env.DB,
+            dataSourceId: env.NOTION_EPISODE_DS_ID,
+            feedUrl: body.feed_url,
+            feedUrlHash: body.feed_url_hash,
+            language: body.language,
+            podcastName: body.podcast_name,
+            runId: body.run_id,
+            taskId: body.task_id,
+            windowItemCount: result.window_item_count,
+          });
+          const taskWriteCount = await countTaskEpisodeWrites(env.DB, body.task_id);
+          let parentUpdateCount = 0;
+          if (taskWriteCount > 0 && body.parent_page_ids.length > 0) {
+            const timestamp = formatShanghaiTimestamp(new Date());
+            const parentUpdates = await updateParentPagesSequentially(
+              body.parent_page_ids,
+              async (parentPageId) => {
+                await updateParentSyncTime(
+                  notionClient,
+                  env.DB,
+                  parentPageId,
+                  timestamp,
+                );
+              },
+            );
+            parentUpdateCount = parentUpdates.updated_count;
+            for (const failure of parentUpdates.failures) {
+              const errorCode =
+                failure.error instanceof ParentBlockError
+                  ? failure.error.code
+                  : "parent_sync_callout_update_failed";
+              writeLog({
+                level: "error",
+                event: "parent_update_failed",
+                error_code: errorCode,
+                run_id: body.run_id,
+                task_id: body.task_id,
+              });
+            }
+            const previousProgress = await loadTaskWriteProgress(body, env);
+            await persistTaskWriteProgress(
+              body,
+              {
+                notion_write_count: taskWriteCount,
+                parent_update_count: parentUpdateCount,
+                description_truncated_count: Math.max(
+                  previousProgress.description_truncated_count,
+                  writes.description_truncated,
+                ),
+              },
+              env,
+            );
+            if (parentUpdates.failures.length > 0) {
+              throw new FeedPipelineError("parent_update_failed", { retryable: true });
+            }
+          }
+          const retainedProgress = await loadTaskWriteProgress(body, env);
+          outcome = {
+            will_write: Math.max(writes.will_write, taskWriteCount),
+            already_exists: writes.already_exists,
+            dedup_failed: writes.dedup_failed,
+            description_truncated: Math.max(
+              writes.description_truncated,
+              retainedProgress.description_truncated_count,
+            ),
+            notion_write_count: taskWriteCount,
+            parent_update_count: Math.max(
+              parentUpdateCount,
+              retainedProgress.parent_update_count,
+            ),
+          };
+        } else {
+          const diff = await buildDryRunDiff(
+            notionClient,
+            env.NOTION_EPISODE_DS_ID,
+            body.podcast_name,
+            result.items,
+            result.window_item_count,
+          );
+          outcome = {
+            ...diff,
+            description_truncated: result.items.filter(
+              (item) => item.description_truncated,
+            ).length,
+            notion_write_count: 0,
+            parent_update_count: 0,
+          };
+        }
+        if (!(await finalizeTaskSucceeded(body, result, outcome, env))) {
           throw new Error("feed_task_not_finalized");
         }
 
         writeLog({
           level: "info",
-          event: "queue_task_dry_run_succeeded",
+          event: writeEnabled ? "queue_task_write_succeeded" : "queue_task_dry_run_succeeded",
           run_id: body.run_id,
           task_id: body.task_id,
           status: "succeeded",
@@ -1216,12 +1415,31 @@ async function handleQueue(batch: MessageBatch<FeedTaskMessage>, env: WorkerEnv)
           parsed_item_count: result.parsed_item_count,
           window_item_count: result.window_item_count,
           redirect_count: result.redirect_count,
-          will_write: diff.will_write,
-          already_exists: diff.already_exists,
-          dedup_failed: diff.dedup_failed,
+          will_write: outcome.will_write,
+          already_exists: outcome.already_exists,
+          dedup_failed: outcome.dedup_failed,
+          notion_write_count: outcome.notion_write_count,
+          parent_update_count: outcome.parent_update_count,
+          description_truncated: outcome.description_truncated,
+          write_enabled: writeEnabled,
         });
         message.ack();
       } catch (error) {
+        const partialWriteCount = await countTaskEpisodeWrites(env.DB, body.task_id);
+        if (partialWriteCount > 0) {
+          const progress = await loadTaskWriteProgress(body, env);
+          await persistTaskWriteProgress(
+            body,
+            {
+              ...progress,
+              notion_write_count: Math.max(
+                progress.notion_write_count,
+                partialWriteCount,
+              ),
+            },
+            env,
+          );
+        }
         const pipelineError =
           error instanceof FeedPipelineError ? error : toNotionFeedError(error);
         if (pipelineError === null) {
@@ -1346,6 +1564,7 @@ async function runRssSelftest(request: Request, env: WorkerEnv): Promise<Respons
       window_start: new Date(nowMs - env.RSS_WINDOW_HOURS * 60 * 60 * 1_000).toISOString(),
       window_end: new Date(nowMs).toISOString(),
       content_fingerprint: feedUrlHash,
+      force_dry_run: true,
     };
     const now = new Date(nowMs).toISOString();
     await env.DB.batch([
@@ -1471,7 +1690,17 @@ async function runManualTrigger(env: WorkerEnv): Promise<Response> {
         409,
       );
     }
-    return json({ ok: true, dry_run: true, run_id: runId, status }, 202);
+    const canaryWritesEnabled = env.CANARY_FEED_HASHES.trim() !== "";
+    return json(
+      {
+        ok: true,
+        dry_run: !canaryWritesEnabled,
+        canary_writes_enabled: canaryWritesEnabled,
+        run_id: runId,
+        status,
+      },
+      202,
+    );
   } catch (error) {
     const errorCode =
       error instanceof Error && /^[a-z0-9_]+$/.test(error.message)
@@ -1479,6 +1708,63 @@ async function runManualTrigger(env: WorkerEnv): Promise<Response> {
         : "manual_run_failed";
     return json({ ok: false, error: errorCode, run_id: runId }, 503);
   }
+}
+
+type ParentCheckResult =
+  | {
+      page_id: string;
+      podcast_name: string;
+      ok: true;
+      block_id: string;
+    }
+  | {
+      page_id: string;
+      podcast_name: string;
+      ok: false;
+      error_code: string;
+    };
+
+async function runParentCheck(env: WorkerEnv, notionToken: string): Promise<Response> {
+  const client = createNotionClient(notionToken);
+  let catalog: Awaited<ReturnType<typeof loadCatalogParentPages>>;
+  try {
+    catalog = await loadCatalogParentPages(client, env.NOTION_MONITOR_DS_ID);
+  } catch (error) {
+    const errorCode =
+      error instanceof CatalogPipelineError ? error.code : "parent_check_catalog_failed";
+    return json({ ok: false, error: errorCode, results: [] }, 502);
+  }
+
+  const results: ParentCheckResult[] = [];
+  for (const parent of catalog.parent_pages) {
+    try {
+      const block = await discoverParentSyncBlock(client, parent.page_id);
+      await cacheParentSyncBlock(env.DB, parent.page_id, block);
+      results.push({
+        page_id: parent.page_id,
+        podcast_name: parent.podcast_name,
+        ok: true,
+        block_id: block.block_id,
+      });
+    } catch (error) {
+      const errorCode =
+        error instanceof ParentBlockError ? error.code : "parent_check_failed";
+      results.push({
+        page_id: parent.page_id,
+        podcast_name: parent.podcast_name,
+        ok: false,
+        error_code: errorCode,
+      });
+      writeLog({
+        level: "warn",
+        event: "parent_check_page_failed",
+        error_code: errorCode,
+      });
+    }
+  }
+
+  const ok = results.every((result) => result.ok);
+  return json({ ok, results }, ok ? 200 : 207);
 }
 
 export default {
@@ -1544,6 +1830,22 @@ export default {
         return json({ ok: false, error: "service_not_configured" }, 503);
       }
       return runManualTrigger(env);
+    }
+
+    if (url.pathname === "/parent-check") {
+      if (request.method !== "POST") {
+        return json({ ok: false, error: "method_not_allowed" }, 405, { Allow: "POST" });
+      }
+      if (!env.MANUAL_TRIGGER_TOKEN) {
+        return json({ ok: false, error: "service_not_configured" }, 503);
+      }
+      if (!(await isAuthorized(request, env.MANUAL_TRIGGER_TOKEN))) {
+        return json({ ok: false, error: "unauthorized" }, 401);
+      }
+      if (!env.NOTION_TOKEN) {
+        return json({ ok: false, error: "service_not_configured" }, 503);
+      }
+      return runParentCheck(env, env.NOTION_TOKEN);
     }
 
     return json({ ok: false, error: "not_found" }, 404);

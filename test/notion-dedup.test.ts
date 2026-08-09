@@ -10,11 +10,25 @@ import type { ParsedFeedItem } from "../src/rss/parser";
 
 function candidate(dedupKey: string): ParsedFeedItem {
   return {
+    author: null,
+    description: null,
+    description_truncated: false,
+    duration: null,
+    episode: null,
+    episode_type: null,
+    explicit: null,
     guid: dedupKey,
+    image_url: null,
+    keywords: [],
     link: null,
+    media_length: null,
+    media_type: null,
     media_url: null,
     published_at: "2026-08-09T00:00:00.000Z",
+    rss_categories: [],
+    season: null,
     title: dedupKey,
+    transcript_url: null,
     dedup_key: dedupKey,
     dedup_source: "guid",
   };

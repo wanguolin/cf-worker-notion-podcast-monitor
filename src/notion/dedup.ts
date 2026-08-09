@@ -166,8 +166,18 @@ export async function queryEpisodeExists(
   podcastName: string,
   dedupKey: string,
 ): Promise<boolean> {
+  return (await queryEpisodeMatch(client, dataSourceId, schema, podcastName, dedupKey)) !== null;
+}
+
+export async function queryEpisodeMatch(
+  client: NotionClient,
+  dataSourceId: string,
+  schema: EpisodeDedupSchema,
+  podcastName: string,
+  dedupKey: string,
+): Promise<string | null> {
   let cursor: string | null = null;
-  let found = false;
+  let foundPageId: string | null = null;
 
   do {
     const response = await client.request(
@@ -189,9 +199,16 @@ export async function queryEpisodeExists(
     if (!isRecord(response.data) || !Array.isArray(response.data.results)) {
       throw new NotionDedupError("notion_dedup_invalid_response");
     }
-    found ||= response.data.results.some(
-      (result) => isRecord(result) && result.archived !== true && result.in_trash !== true,
-    );
+    for (const result of response.data.results) {
+      if (
+        isRecord(result) &&
+        result.archived !== true &&
+        result.in_trash !== true &&
+        typeof result.id === "string"
+      ) {
+        foundPageId ??= result.id;
+      }
+    }
 
     if (response.data.has_more === true && typeof response.data.next_cursor === "string") {
       cursor = response.data.next_cursor;
@@ -202,7 +219,7 @@ export async function queryEpisodeExists(
     }
   } while (cursor !== null);
 
-  return found;
+  return foundPageId;
 }
 
 export async function buildDryRunDiff(

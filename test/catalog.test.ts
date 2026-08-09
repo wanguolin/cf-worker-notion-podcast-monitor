@@ -86,5 +86,10 @@ describe("Notion catalog pagination and feed grouping", () => {
     });
     expect(snapshot.feeds[0]?.feed_url_hash).toMatch(/^[a-f0-9]{64}$/);
     expect(snapshot.feeds[0]?.content_fingerprint).toMatch(/^[a-f0-9]{64}$/);
+    expect(snapshot.parent_pages).toEqual([
+      { page_id: "empty-rss", podcast_name: "No Feed" },
+      { page_id: "parent-a", podcast_name: "Masters in Business" },
+      { page_id: "parent-b", podcast_name: "Masters in Business" },
+    ]);
   });
 });

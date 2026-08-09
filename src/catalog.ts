@@ -36,6 +36,17 @@ export type CatalogSnapshot = {
   catalog_row_count: number;
   feeds: CatalogFeed[];
   issue_counts: Partial<Record<CatalogIssueCode, number>>;
+  parent_pages: CatalogParentPage[];
+};
+
+export type CatalogParentPage = {
+  page_id: string;
+  podcast_name: string;
+};
+
+export type CatalogParentSnapshot = {
+  catalog_row_count: number;
+  parent_pages: CatalogParentPage[];
 };
 
 function isRecord(value: unknown): value is JsonRecord {
@@ -172,13 +183,43 @@ async function queryCatalogPages(
   return pages;
 }
 
+function activeCatalogPages(pages: JsonRecord[]): JsonRecord[] {
+  return pages.filter((page) => page.archived !== true && page.in_trash !== true);
+}
+
+function catalogParentPages(activePages: JsonRecord[]): CatalogParentPage[] {
+  const parents = activePages.map((page) => {
+    if (typeof page.id !== "string") {
+      throw new CatalogPipelineError("catalog_invalid_response");
+    }
+    return {
+      page_id: page.id,
+      podcast_name: textProperty(page, "播客名称"),
+    };
+  });
+  parents.sort((left, right) => left.page_id.localeCompare(right.page_id));
+  return parents;
+}
+
+export async function loadCatalogParentPages(
+  client: NotionClient,
+  dataSourceId: string,
+): Promise<CatalogParentSnapshot> {
+  const activePages = activeCatalogPages(await queryCatalogPages(client, dataSourceId));
+  return {
+    catalog_row_count: activePages.length,
+    parent_pages: catalogParentPages(activePages),
+  };
+}
+
 export async function loadPodcastCatalog(
   client: NotionClient,
   dataSourceId: string,
 ): Promise<CatalogSnapshot> {
   const pages = await queryCatalogPages(client, dataSourceId);
   const issues: Partial<Record<CatalogIssueCode, number>> = {};
-  const activePages = pages.filter((page) => page.archived !== true && page.in_trash !== true);
+  const activePages = activeCatalogPages(pages);
+  const parentPages = catalogParentPages(activePages);
   const grouped = new Map<
     string,
     {
@@ -269,5 +310,6 @@ export async function loadPodcastCatalog(
     catalog_row_count: activePages.length,
     feeds,
     issue_counts: issues,
+    parent_pages: parentPages,
   };
 }

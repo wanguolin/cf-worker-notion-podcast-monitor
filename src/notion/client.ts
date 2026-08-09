@@ -24,7 +24,7 @@ export type NotionResponse = {
 };
 
 export type NotionRequestOptions = {
-  retry?: boolean;
+  retry?: boolean | "rate_limit";
 };
 
 export type NotionClient = {
@@ -121,6 +121,16 @@ function isRetryableStatus(status: number): boolean {
   return status === 429 || status === 529 || [500, 502, 503, 504].includes(status);
 }
 
+function shouldRetryStatus(
+  retry: NotionRequestOptions["retry"],
+  status: number,
+): boolean {
+  if (retry === "rate_limit") {
+    return status === 429 || status === 529;
+  }
+  return retry === true && isRetryableStatus(status);
+}
+
 export function createNotionClient(token: string, options: NotionClientOptions = {}): NotionClient {
   const fetchImpl = options.fetchImpl ?? fetch;
   const sleepImpl =
@@ -214,8 +224,7 @@ export function createNotionClient(token: string, options: NotionClientOptions =
 
         const details = notionErrorSummary(response.status, data);
         if (
-          requestOptions.retry === true &&
-          isRetryableStatus(response.status) &&
+          shouldRetryStatus(requestOptions.retry, response.status) &&
           attempt < maxRetries
         ) {
           const retryAfter = parseRetryAfterMs(response.headers.get("Retry-After"), now());

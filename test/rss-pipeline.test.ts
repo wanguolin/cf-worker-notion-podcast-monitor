@@ -200,6 +200,49 @@ describe("XML safety limits", () => {
     expect(result.items[0]?.title).toBe("测试");
     expect(result.xml_encoding).toBe("gbk");
   });
+
+  it("extracts extended podcast fields and truncates description while streaming", async () => {
+    const response = responseFromXml(`<?xml version="1.0"?>
+      <rss xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd"
+           xmlns:content="http://purl.org/rss/1.0/modules/content/"
+           xmlns:podcast="https://podcastindex.org/namespace/1.0">
+        <channel><item>
+          <guid>extended-guid</guid><title>Extended episode</title>
+          <pubDate>Fri, 08 Aug 2026 20:00:00 GMT</pubDate>
+          <itunes:author>Author A</itunes:author><itunes:duration>01:02:03</itunes:duration>
+          <itunes:season>2</itunes:season><itunes:episode>7</itunes:episode>
+          <itunes:episodeType>full</itunes:episodeType><itunes:explicit>no</itunes:explicit>
+          <itunes:category text="Business"/><category>Technology</category>
+          <itunes:keywords>investing, AI</itunes:keywords>
+          <itunes:image href="https://cdn.example.com/cover.jpg"/>
+          <podcast:transcript url="https://example.com/transcript.json" type="application/json"/>
+          <enclosure url="https://cdn.example.com/episode.mp3" type="audio/mpeg" length="123456"/>
+          <content:encoded><![CDATA[${"长".repeat(100)}]]></content:encoded>
+        </item></channel>
+      </rss>`);
+    const result = await fetchAndParseFeed("https://feeds.example.com/extended.xml", WINDOW, {
+      ...BASE_OPTIONS,
+      maxDescriptionCharacters: 20,
+      fetchImpl: async () => response,
+    });
+    expect(result.items[0]).toMatchObject({
+      author: "Author A",
+      description: "长".repeat(20),
+      description_truncated: true,
+      duration: "01:02:03",
+      season: "2",
+      episode: "7",
+      episode_type: "full",
+      explicit: "no",
+      rss_categories: ["Business", "Technology"],
+      keywords: ["investing", "AI"],
+      image_url: "https://cdn.example.com/cover.jpg",
+      transcript_url: "https://example.com/transcript.json",
+      media_url: "https://cdn.example.com/episode.mp3",
+      media_type: "audio/mpeg",
+      media_length: "123456",
+    });
+  });
 });
 
 describe("URL security and redirects", () => {

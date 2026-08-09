@@ -7,18 +7,56 @@ const DEFAULT_MAX_XML_DEPTH = 64;
 const DEFAULT_MAX_FIELD_CHARACTERS = 8_192;
 const DEFAULT_MAX_WINDOW_ITEMS = 5_000;
 const DEFAULT_MAX_RETAINED_CHARACTERS = 4 * 1024 * 1024;
+const DEFAULT_MAX_DESCRIPTION_CHARACTERS = 2_000;
+const DEFAULT_MAX_LIST_VALUES = 100;
 const ENCODING_SNIFF_BYTES = 1_024;
 
-type CapturedField = "guid" | "link" | "mediaUrl" | "publishedAt" | "title";
+type ScalarField =
+  | "author"
+  | "description"
+  | "duration"
+  | "episode"
+  | "episodeType"
+  | "explicit"
+  | "guid"
+  | "imageUrl"
+  | "link"
+  | "mediaLength"
+  | "mediaType"
+  | "mediaUrl"
+  | "publishedAt"
+  | "season"
+  | "title"
+  | "transcriptUrl";
+type CapturedField = ScalarField | "category" | "keywords";
 
-type MutableItem = Record<CapturedField, string | null>;
+type MutableItem = Record<ScalarField, string | null> & {
+  categories: string[];
+  descriptionPriority: number;
+  descriptionTruncated: boolean;
+  keywords: string[];
+};
 
 export type ParsedFeedItem = {
+  author: string | null;
+  description: string | null;
+  description_truncated: boolean;
+  duration: string | null;
+  episode: string | null;
+  episode_type: string | null;
+  explicit: string | null;
   guid: string | null;
+  image_url: string | null;
+  keywords: string[];
   link: string | null;
+  media_length: string | null;
+  media_type: string | null;
   media_url: string | null;
   published_at: string;
+  rss_categories: string[];
+  season: string | null;
   title: string | null;
+  transcript_url: string | null;
   dedup_key: string;
   dedup_source: DedupSource;
 };
@@ -39,6 +77,7 @@ export type ParseFeedOptions = {
   abortSignal?: AbortSignal;
   maxDepth?: number;
   maxFieldCharacters?: number;
+  maxDescriptionCharacters?: number;
   maxWindowItems?: number;
   maxRetainedCharacters?: number;
   softDeadlineAt?: number;
@@ -46,7 +85,55 @@ export type ParseFeedOptions = {
 };
 
 function emptyItem(): MutableItem {
-  return { guid: null, link: null, mediaUrl: null, publishedAt: null, title: null };
+  return {
+    author: null,
+    categories: [],
+    description: null,
+    descriptionPriority: -1,
+    descriptionTruncated: false,
+    duration: null,
+    episode: null,
+    episodeType: null,
+    explicit: null,
+    guid: null,
+    imageUrl: null,
+    keywords: [],
+    link: null,
+    mediaLength: null,
+    mediaType: null,
+    mediaUrl: null,
+    publishedAt: null,
+    season: null,
+    title: null,
+    transcriptUrl: null,
+  };
+}
+
+function addUniqueValue(values: string[], value: string): void {
+  const normalized = value.trim();
+  if (
+    normalized !== "" &&
+    values.length < DEFAULT_MAX_LIST_VALUES &&
+    !values.includes(normalized)
+  ) {
+    values.push(normalized);
+  }
+}
+
+function retainedItemCharacters(item: MutableItem): number {
+  let total = item.categories.join("").length + item.keywords.join("").length;
+  for (const [key, value] of Object.entries(item)) {
+    if (
+      key !== "categories" &&
+      key !== "keywords" &&
+      key !== "descriptionPriority" &&
+      key !== "descriptionTruncated" &&
+      typeof value === "string"
+    ) {
+      total += value.length;
+    }
+  }
+  return total;
 }
 
 function attributeValue(tag: SaxesTagNS, localName: string): string | null {
@@ -130,6 +217,8 @@ export async function parseFeedByteStream(
 
   const maxDepth = options.maxDepth ?? DEFAULT_MAX_XML_DEPTH;
   const maxFieldCharacters = options.maxFieldCharacters ?? DEFAULT_MAX_FIELD_CHARACTERS;
+  const maxDescriptionCharacters =
+    options.maxDescriptionCharacters ?? DEFAULT_MAX_DESCRIPTION_CHARACTERS;
   const maxWindowItems = options.maxWindowItems ?? DEFAULT_MAX_WINDOW_ITEMS;
   const maxRetainedCharacters =
     options.maxRetainedCharacters ?? DEFAULT_MAX_RETAINED_CHARACTERS;
@@ -139,7 +228,13 @@ export async function parseFeedByteStream(
   let depth = 0;
   let itemDepth: number | null = null;
   let currentItem: MutableItem | null = null;
-  let capturedField: { field: CapturedField; depth: number } | null = null;
+  let capturedField: {
+    field: CapturedField;
+    depth: number;
+    priority: number;
+    text: string;
+    truncated: boolean;
+  } | null = null;
   let parserError: FeedPipelineError | null = null;
   let sawFeedRoot = false;
   let retainedCharacters = 0;
@@ -151,27 +246,72 @@ export async function parseFeedByteStream(
     throw error;
   };
 
+  const boundedAttributeValue = (tag: SaxesTagNS, localName: string): string | null => {
+    const value = attributeValue(tag, localName);
+    if (value !== null && value.length > maxFieldCharacters) {
+      fail(new FeedPipelineError("xml_field_too_large"));
+    }
+    return value;
+  };
+
   const appendText = (text: string): void => {
     if (currentItem === null || capturedField === null || text.length === 0) {
       return;
     }
-    const previous = currentItem[capturedField.field] ?? "";
-    if (previous.length + text.length > maxFieldCharacters) {
+    const limit =
+      capturedField.field === "description"
+        ? maxDescriptionCharacters
+        : maxFieldCharacters;
+    const remaining = limit - capturedField.text.length;
+    if (remaining <= 0) {
+      if (capturedField.field === "description") {
+        capturedField.truncated = true;
+        return;
+      }
       fail(new FeedPipelineError("xml_field_too_large"));
     }
-    currentItem[capturedField.field] = previous + text;
+    if (text.length > remaining) {
+      if (capturedField.field !== "description") {
+        fail(new FeedPipelineError("xml_field_too_large"));
+      }
+      capturedField.text += text.slice(0, remaining);
+      capturedField.truncated = true;
+      return;
+    }
+    capturedField.text += text;
   };
 
   parser.on("error", () => {
     fail(parserError ?? new FeedPipelineError("xml_malformed"));
   });
-  const startCapture = (field: CapturedField): void => {
-    capturedField = { field, depth };
+  const startCapture = (field: CapturedField, priority = 0): void => {
+    if (capturedField !== null) {
+      return;
+    }
+    capturedField = { field, depth, priority, text: "", truncated: false };
     parser.on("text", appendText);
     parser.on("cdata", appendText);
   };
 
   const stopCapture = (): void => {
+    if (currentItem !== null && capturedField !== null) {
+      const value = capturedField.text.trim();
+      if (capturedField.field === "category") {
+        addUniqueValue(currentItem.categories, value);
+      } else if (capturedField.field === "keywords") {
+        for (const keyword of value.split(/[,，]/)) {
+          addUniqueValue(currentItem.keywords, keyword);
+        }
+      } else if (capturedField.field === "description") {
+        if (value !== "" && capturedField.priority > currentItem.descriptionPriority) {
+          currentItem.description = value;
+          currentItem.descriptionPriority = capturedField.priority;
+          currentItem.descriptionTruncated = capturedField.truncated;
+        }
+      } else if (value !== "" && currentItem[capturedField.field] === null) {
+        currentItem[capturedField.field] = value;
+      }
+    }
     capturedField = null;
     parser.off("text");
     parser.off("cdata");
@@ -198,16 +338,52 @@ export async function parseFeedByteStream(
       return;
     }
 
-    if (local === "enclosure" || (tag.prefix.toLowerCase() === "media" && local === "content")) {
-      currentItem.mediaUrl ??= attributeValue(tag, "url");
+    const prefix = tag.prefix.toLowerCase();
+    if (local === "enclosure" || (prefix === "media" && local === "content")) {
+      currentItem.mediaUrl ??= boundedAttributeValue(tag, "url");
+      currentItem.mediaType ??= boundedAttributeValue(tag, "type");
+      currentItem.mediaLength ??=
+        boundedAttributeValue(tag, "length") ?? boundedAttributeValue(tag, "filesize");
+      return;
+    }
+
+    if (local === "transcript" && prefix === "podcast") {
+      currentItem.transcriptUrl ??= boundedAttributeValue(tag, "url");
+      return;
+    }
+
+    if (local === "image" && prefix === "itunes") {
+      currentItem.imageUrl ??= boundedAttributeValue(tag, "href");
+      return;
+    }
+
+    if (local === "thumbnail" && prefix === "media") {
+      currentItem.imageUrl ??= boundedAttributeValue(tag, "url");
+      return;
+    }
+
+    if (local === "category") {
+      const attributeCategory =
+        boundedAttributeValue(tag, "text") ?? boundedAttributeValue(tag, "term");
+      if (attributeCategory !== null) {
+        addUniqueValue(currentItem.categories, attributeCategory);
+        return;
+      }
+      startCapture("category");
       return;
     }
 
     if (local === "link") {
-      const href = attributeValue(tag, "href");
-      const rel = attributeValue(tag, "rel")?.toLowerCase() ?? "alternate";
+      const href = boundedAttributeValue(tag, "href");
+      const rel = boundedAttributeValue(tag, "rel")?.toLowerCase() ?? "alternate";
+      if (href !== null && rel === "enclosure") {
+        currentItem.mediaUrl ??= href;
+        currentItem.mediaType ??= boundedAttributeValue(tag, "type");
+        currentItem.mediaLength ??= boundedAttributeValue(tag, "length");
+        return;
+      }
       if (href !== null && (rel === "alternate" || currentItem.link === null)) {
-        currentItem.link = href;
+        currentItem.link ??= href;
         return;
       }
       startCapture("link");
@@ -221,9 +397,31 @@ export async function parseFeedByteStream(
           ? "title"
           : local === "pubdate" || local === "published" || local === "updated" || local === "date"
             ? "publishedAt"
+            : local === "author" || local === "creator"
+              ? "author"
+              : local === "duration"
+                ? "duration"
+                : local === "season"
+                  ? "season"
+                  : local === "episode"
+                    ? "episode"
+                    : local === "episodetype"
+                      ? "episodeType"
+                      : local === "explicit"
+                        ? "explicit"
+                        : local === "keywords"
+                          ? "keywords"
+                          : local === "summary" || local === "subtitle"
+                            ? "description"
+                            : local === "description"
+                              ? "description"
+                              : local === "encoded" && prefix === "content"
+                                ? "description"
             : null;
     if (field !== null) {
-      startCapture(field);
+      const descriptionPriority =
+        local === "encoded" ? 4 : local === "description" ? 3 : local === "summary" ? 2 : 1;
+      startCapture(field, field === "description" ? descriptionPriority : 0);
     }
   });
   parser.on("closetag", (tag: SaxesTagNS) => {
@@ -250,12 +448,7 @@ export async function parseFeedByteStream(
           if (rawWindowItems.length >= maxWindowItems) {
             fail(new FeedPipelineError("too_many_window_items"));
           }
-          retainedCharacters +=
-            (finishedItem.guid?.length ?? 0) +
-            (finishedItem.link?.length ?? 0) +
-            (finishedItem.mediaUrl?.length ?? 0) +
-            (finishedItem.publishedAt?.length ?? 0) +
-            (finishedItem.title?.length ?? 0);
+          retainedCharacters += retainedItemCharacters(finishedItem);
           if (retainedCharacters > maxRetainedCharacters) {
             fail(new FeedPipelineError("window_items_too_large"));
           }
@@ -390,11 +583,25 @@ export async function parseFeedByteStream(
     });
     if (dedup !== null) {
       items.push({
+        author: rawItem.author?.trim() || null,
+        description: rawItem.description?.trim() || null,
+        description_truncated: rawItem.descriptionTruncated,
+        duration: rawItem.duration?.trim() || null,
+        episode: rawItem.episode?.trim() || null,
+        episode_type: rawItem.episodeType?.trim() || null,
+        explicit: rawItem.explicit?.trim() || null,
         guid: rawItem.guid?.trim() || null,
+        image_url: rawItem.imageUrl?.trim() || null,
+        keywords: rawItem.keywords,
         link: rawItem.link?.trim() || null,
+        media_length: rawItem.mediaLength?.trim() || null,
+        media_type: rawItem.mediaType?.trim() || null,
         media_url: rawItem.mediaUrl?.trim() || null,
         published_at: rawItem.normalizedPublishedAt,
+        rss_categories: rawItem.categories,
+        season: rawItem.season?.trim() || null,
         title: rawItem.title?.trim() || null,
+        transcript_url: rawItem.transcriptUrl?.trim() || null,
         dedup_key: dedup.key,
         dedup_source: dedup.source,
       });

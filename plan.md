@@ -297,8 +297,8 @@ Notion `POST /pages` 没有可依赖的业务幂等键，因此必须处理“�
 公共 Notion REST API 不支持当前 MCP 风格的整页 Markdown `update_content` 搜索替换，因此采用 block 级更新：
 
 1. 首次读取父页 block children。
-2. 找到唯一的 `内容同步时间：...（Asia/Shanghai）` paragraph block。
-3. 验证只有一个匹配项；零个或多个匹配都停止更新并报警。
+2. 找到唯一的“内容同步时间”块。已实地核实：该内容位于一个 callout 块（🔄 蓝底）内，rich text 为粗体 `内容同步时间：YYYY-MM-DD HH:mm:ss（Asia/Shanghai）` 行，后跟换行和说明文字；更新时只替换时间部分的 rich text 片段，必须保留 callout 其余文字与格式。
+3. 验证只有一个匹配块；零个或多个匹配都停止更新并报警。
 4. 用 Update block API 只替换该 paragraph 的 rich text。
 5. 将 block ID 缓存在 D1；后续遇到 404、类型变化或内容前缀不匹配时重新发现。
 6. 同一 RSS 映射多个当前父页时，全部父页都必须成功更新。
