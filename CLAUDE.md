@@ -13,7 +13,7 @@ npm run typecheck                 # tsc --noEmit
 npm test                          # vitest 全量
 npx vitest run test/rss-pipeline.test.ts   # 单个测试文件
 npm run dev                       # wrangler dev --env finance-production（--test-scheduled 可触发 scheduled）
-npm run deploy                    # wrangler deploy --env finance-production
+npm run deploy                    # wrangler deploy --env finance-production（手动部署；push 到 main 会经后台 hook 自动部署，通常无需手动执行）
 npm run trigger                   # 读取 .env 的 MANUAL_TRIGGER_TOKEN 手动补跑
 npx wrangler types                # 改 wrangler.jsonc 后必须重新生成 worker-configuration.d.ts
 npx wrangler d1 migrations apply podcast-monitor-finance-production --local --env finance-production
