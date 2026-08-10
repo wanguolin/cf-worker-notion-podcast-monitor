@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev --env finance-production",
-    "deploy": "wrangler deploy --env finance-production",
+    "db:migrate:remote": "wrangler d1 migrations apply DB --remote --env finance-production",
+    "deploy": "npm run db:migrate:remote && wrangler deploy --env finance-production",
     "trigger": "node scripts/trigger.mjs",
     "test": "vitest run --maxWorkers=1",
     "typecheck": "tsc --noEmit"
@@ -18,5 +19,24 @@
   },
   "dependencies": {
     "saxes": "^6.0.0"
+  },
+  "cloudflare": {
+    "bindings": {
+      "NOTION_TOKEN": {
+        "description": "Notion Internal Integration secret. Only share the duplicated template page and grant Read, Insert, and Update content capabilities."
+      },
+      "NOTION_MONITOR_DATA_SOURCE_ID": {
+        "description": "Data source ID of the duplicated `财经播客监控` database. This is not the database page ID."
+      },
+      "NOTION_EPISODE_DATA_SOURCE_ID": {
+        "description": "Data source ID of the duplicated `财经播客单集库` database. This is not the database page ID."
+      },
+      "MANUAL_TRIGGER_TOKEN": {
+        "description": "A random bearer token for protected manual endpoints. Generate one with `openssl rand -hex 32`."
+      },
+      "FEED_TASKS_DLQ_NAME": {
+        "description": "Must match the dead-letter Queue name. Keep the default unless you also rename the Queue resource."
+      }
+    }
   }
 }

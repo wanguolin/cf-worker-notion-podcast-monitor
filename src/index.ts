@@ -38,7 +38,6 @@ const PREVIOUS_RUN_WINDOW_MS = 24 * 60 * 60 * 1_000;
 const RUN_HEARTBEAT_STALE_MS = 2 * 60 * 60 * 1_000;
 const PRODUCER_LOCK_LEASE_MS = 5 * 60 * 1_000;
 const PRODUCER_LOCK_NAME = "catalog_outbox_producer";
-const FEED_TASKS_DLQ_NAME = "podcast-monitor-dlq-finance-production";
 const QUEUE_SEND_BATCH_SIZE = 100;
 const QUEUE_MESSAGE_SAFE_BYTES = 120_000;
 const QUEUE_SEND_BATCH_SAFE_BYTES = 240_000;
@@ -567,7 +566,7 @@ async function runSelftest(env: WorkerEnv, notionToken: string): Promise<Respons
   });
 
   const monitorSchema = await notionRequest(
-    `/v1/data_sources/${encodeURIComponent(env.NOTION_MONITOR_DS_ID)}`,
+    `/v1/data_sources/${encodeURIComponent(env.NOTION_MONITOR_DATA_SOURCE_ID)}`,
   );
   if (!monitorSchema.ok) {
     steps.push(failedCallStep("retrieve_monitor_schema", monitorSchema));
@@ -591,7 +590,7 @@ async function runSelftest(env: WorkerEnv, notionToken: string): Promise<Respons
   });
 
   const monitorQuery = await notionRequest(
-    `/v1/data_sources/${encodeURIComponent(env.NOTION_MONITOR_DS_ID)}/query`,
+    `/v1/data_sources/${encodeURIComponent(env.NOTION_MONITOR_DATA_SOURCE_ID)}/query`,
     { method: "POST", body: notionJsonBody({ page_size: 1 }) },
   );
   if (!monitorQuery.ok) {
@@ -616,7 +615,7 @@ async function runSelftest(env: WorkerEnv, notionToken: string): Promise<Respons
   });
 
   const episodeSchema = await notionRequest(
-    `/v1/data_sources/${encodeURIComponent(env.NOTION_EPISODE_DS_ID)}`,
+    `/v1/data_sources/${encodeURIComponent(env.NOTION_EPISODE_DATA_SOURCE_ID)}`,
   );
   if (!episodeSchema.ok) {
     steps.push(failedCallStep("retrieve_episode_schema", episodeSchema));
@@ -642,7 +641,7 @@ async function runSelftest(env: WorkerEnv, notionToken: string): Promise<Respons
   });
 
   const episodeQuery = await notionRequest(
-    `/v1/data_sources/${encodeURIComponent(env.NOTION_EPISODE_DS_ID)}/query`,
+    `/v1/data_sources/${encodeURIComponent(env.NOTION_EPISODE_DATA_SOURCE_ID)}/query`,
     { method: "POST", body: notionJsonBody({ page_size: 1 }) },
   );
   if (!episodeQuery.ok) {
@@ -674,7 +673,7 @@ async function runSelftest(env: WorkerEnv, notionToken: string): Promise<Respons
       body: notionJsonBody({
         parent: {
           type: "data_source_id",
-          data_source_id: env.NOTION_EPISODE_DS_ID,
+          data_source_id: env.NOTION_EPISODE_DATA_SOURCE_ID,
         },
         properties: {
           [titlePropertyName]: {
@@ -834,7 +833,7 @@ async function handleProducer(
 
         const catalog = await loadPodcastCatalog(
           createNotionClient(env.NOTION_TOKEN),
-          env.NOTION_MONITOR_DS_ID,
+          env.NOTION_MONITOR_DATA_SOURCE_ID,
         );
         for (const [errorCode, issueCount] of Object.entries(catalog.issue_counts)) {
           if (issueCount !== undefined && issueCount > 0) {
@@ -1425,7 +1424,7 @@ export async function handleQueue(
   batch: MessageBatch<FeedTaskMessage>,
   env: WorkerEnv,
 ): Promise<void> {
-  if (batch.queue === FEED_TASKS_DLQ_NAME) {
+  if (batch.queue === env.FEED_TASKS_DLQ_NAME) {
     await handleDeadLetterQueue(batch, env);
     return;
   }
@@ -1567,7 +1566,7 @@ export async function handleQueue(
             categories: body.categories,
             client: notionClient,
             database: env.DB,
-            dataSourceId: env.NOTION_EPISODE_DS_ID,
+            dataSourceId: env.NOTION_EPISODE_DATA_SOURCE_ID,
             feedUrl: body.feed_url,
             feedUrlHash: body.feed_url_hash,
             language: body.language,
@@ -1651,7 +1650,7 @@ export async function handleQueue(
         } else {
           const diff = await buildDryRunDiff(
             notionClient,
-            env.NOTION_EPISODE_DS_ID,
+            env.NOTION_EPISODE_DATA_SOURCE_ID,
             body.podcast_name,
             result.items,
             result.window_item_count,
@@ -1994,7 +1993,7 @@ async function runParentCheck(env: WorkerEnv, notionToken: string): Promise<Resp
   const client = createNotionClient(notionToken);
   let catalog: Awaited<ReturnType<typeof loadCatalogParentPages>>;
   try {
-    catalog = await loadCatalogParentPages(client, env.NOTION_MONITOR_DS_ID);
+    catalog = await loadCatalogParentPages(client, env.NOTION_MONITOR_DATA_SOURCE_ID);
   } catch (error) {
     const errorCode =
       error instanceof CatalogPipelineError ? error.code : "parent_check_catalog_failed";

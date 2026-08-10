@@ -1,7 +1,5 @@
 import { readFile } from "node:fs/promises";
 
-const endpoint =
-  "https://cf-worker-notion-podcast-monitor-finance-production.polymaster.workers.dev/trigger-run";
 const envPath = new URL("../.env", import.meta.url);
 
 function parseEnv(source) {
@@ -43,6 +41,24 @@ try {
 const token = parseEnv(envSource).get("MANUAL_TRIGGER_TOKEN");
 if (!token) {
   console.error(".env 缺少 MANUAL_TRIGGER_TOKEN，请先配置后再运行。");
+  process.exit(1);
+}
+
+const workerUrl = process.argv[2] ?? process.env.WORKER_URL;
+if (!workerUrl) {
+  console.error("缺少 Worker URL。请设置 WORKER_URL，或运行 npm run trigger -- https://<worker>.workers.dev。");
+  process.exit(1);
+}
+
+let endpoint;
+try {
+  const url = new URL(workerUrl);
+  url.pathname = "/trigger-run";
+  url.search = "";
+  url.hash = "";
+  endpoint = url.toString();
+} catch {
+  console.error("Worker URL 无效。");
   process.exit(1);
 }
 

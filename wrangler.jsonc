@@ -5,19 +5,25 @@
   "compatibility_date": "2026-08-08",
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
 
-  // Secrets are environment-specific and must never be stored here:
+  // Secrets are environment-specific and must never be stored here.
+  // Deploy-button users are prompted for all required values from .dev.vars.example:
   // npx wrangler secret put NOTION_TOKEN --env finance-production
   // npx wrangler secret put MANUAL_TRIGGER_TOKEN --env finance-production
+  // npx wrangler secret put NOTION_MONITOR_DATA_SOURCE_ID --env finance-production
+  // npx wrangler secret put NOTION_EPISODE_DATA_SOURCE_ID --env finance-production
   "env": {
     "finance-production": {
       "name": "cf-worker-notion-podcast-monitor-finance-production",
       "secrets": {
-        "required": ["NOTION_TOKEN", "MANUAL_TRIGGER_TOKEN"]
+        "required": [
+          "NOTION_TOKEN",
+          "MANUAL_TRIGGER_TOKEN",
+          "NOTION_MONITOR_DATA_SOURCE_ID",
+          "NOTION_EPISODE_DATA_SOURCE_ID"
+        ]
       },
       "vars": {
         "ENV_NAME": "finance-production",
-        "NOTION_MONITOR_DS_ID": "6770eb15-6002-4bd9-8791-53f8fc968cab",
-        "NOTION_EPISODE_DS_ID": "c6518896-0a17-43bb-8f95-b88933d211cb",
         "RSS_WINDOW_HOURS": 26,
         "RSS_MAX_BYTES": 33554432,
         "RSS_CONNECT_TIMEOUT_MS": 15000,
@@ -30,6 +36,8 @@
         "MESSAGE_SOFT_DEADLINE_MS": 720000,
         // Non-empty allowlist enables real writes only for the listed feed hashes.
         "CANARY_FEED_HASHES": "",
+        // Keep this equal to queues.consumers[1].queue when renaming resources.
+        "FEED_TASKS_DLQ_NAME": "podcast-monitor-dlq-finance-production",
         "DRY_RUN": false
       },
       "triggers": {

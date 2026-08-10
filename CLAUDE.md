@@ -13,16 +13,16 @@ npm run typecheck                 # tsc --noEmit
 npm test                          # vitest 全量
 npx vitest run test/rss-pipeline.test.ts   # 单个测试文件
 npm run dev                       # wrangler dev --env finance-production（--test-scheduled 可触发 scheduled）
-npm run deploy                    # wrangler deploy --env finance-production（手动部署；push 到 main 会经后台 hook 自动部署，通常无需手动执行）
-npm run trigger                   # 读取 .env 的 MANUAL_TRIGGER_TOKEN 手动补跑
+npm run deploy                    # 先应用远程 D1 migrations，再部署 finance-production；push main 通常会由后台 hook 自动执行
+npm run trigger -- <WORKER_URL>   # 读取 .env 的 MANUAL_TRIGGER_TOKEN 手动补跑
 npx wrangler types                # 改 wrangler.jsonc 后必须重新生成 worker-configuration.d.ts
 npx wrangler d1 migrations apply podcast-monitor-finance-production --local --env finance-production
-npx wrangler d1 migrations apply podcast-monitor-finance-production --remote --env finance-production  # 部署含新迁移的版本前必须先执行
+npx wrangler d1 migrations apply DB --remote --env finance-production
 # https://cf-worker-notion-podcast-monitor-finance-production.polymaster.workers.dev/logs  # 公开只读网页观测，日志滚动保留 7 天
 ```
 
 - 唯一环境是 `env.finance-production`（用户决定不设 staging）；Worker 名 `cf-worker-notion-podcast-monitor-finance-production`。
-- Secrets（`NOTION_TOKEN`、`MANUAL_TRIGGER_TOKEN`）用 `wrangler secret put <NAME> --env finance-production` 设置，绝不落盘进仓库。本地 `.env`（gitignored）保存 `MANUAL_TRIGGER_TOKEN`，供 `npm run trigger` 使用。
+- Secrets（`NOTION_TOKEN`、`MANUAL_TRIGGER_TOKEN`、`NOTION_MONITOR_DATA_SOURCE_ID`、`NOTION_EPISODE_DATA_SOURCE_ID`）用 `wrangler secret put <NAME> --env finance-production` 设置，绝不落盘进仓库。本地 `.env`（gitignored）保存 `MANUAL_TRIGGER_TOKEN`，供 `npm run trigger -- <WORKER_URL>` 使用。
 - 部署后新版本有约 1 分钟传播延迟：紧接着调用端点可能落在旧实例，判定结果前先重试确认。
 
 ## 架构

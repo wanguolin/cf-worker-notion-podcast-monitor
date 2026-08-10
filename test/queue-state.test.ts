@@ -167,7 +167,10 @@ describe("Queue and run terminal-state recovery", () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
 
     try {
-      await handleQueue(batch, { DB: database } as WorkerEnv);
+      await handleQueue(batch, {
+        DB: database,
+        FEED_TASKS_DLQ_NAME: "podcast-monitor-dlq-finance-production",
+      } as WorkerEnv);
     } finally {
       consoleError.mockRestore();
     }
