@@ -6,7 +6,11 @@ import { htmlToPlainText, truncatePlainText } from "./html";
 
 const DEFAULT_MAX_XML_DEPTH = 64;
 const DEFAULT_MAX_FIELD_CHARACTERS = 8_192;
-const DEFAULT_MAX_WINDOW_ITEMS = 5_000;
+// 上限须保证最坏情况在 MESSAGE_SOFT_DEADLINE_MS（720s）内单次尝试完成：
+// 全新单集成功路径为每集 4 次串行 Notion 请求（首次排重、写前复查、创建、创建后验证，
+// 间隔 1s），另有每任务 1 次 schema 读取、父页更新与 Feed 下载解析时间、429 退避余量。
+// 100 集 ≈ 400+ 次请求 ≈ 400s+，防止恶意 Feed 反复烧满消息预算堵塞串行队列。
+const DEFAULT_MAX_WINDOW_ITEMS = 100;
 const DEFAULT_MAX_RETAINED_CHARACTERS = 4 * 1024 * 1024;
 const DEFAULT_MAX_DESCRIPTION_CHARACTERS = 2_000;
 const DEFAULT_MAX_DESCRIPTION_SOURCE_CHARACTERS = 16_000;

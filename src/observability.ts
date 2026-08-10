@@ -1,7 +1,12 @@
 const LOG_RETENTION_DAYS = 7;
+// 公开匿名端点：行数上限与快照缓存共同封顶单请求的 D1 读取成本，
+// 防止刷新风暴放大 D1 费用。上限远高于 7 天正常量（每日 1 次 cron + 少量手动补跑）。
+const LOG_MAX_RUN_ROWS = 40;
+const LOG_MAX_FEED_TASK_ROWS = 2_000;
+const LOG_SNAPSHOT_TTL_MS = 60_000;
 
 const LOG_RESPONSE_HEADERS = {
-  "Cache-Control": "no-store",
+  "Cache-Control": "public, max-age=60",
   "X-Robots-Tag": "noindex",
 } as const;
 
@@ -105,7 +110,8 @@ export async function loadLogSnapshot(database: LogDatabase): Promise<PublicLogS
       parent_update_count
     FROM runs
     WHERE datetime(started_at) >= datetime('now', '-7 days')
-    ORDER BY datetime(started_at) DESC, run_id DESC`,
+    ORDER BY datetime(started_at) DESC, run_id DESC
+    LIMIT ${LOG_MAX_RUN_ROWS}`,
   ).all<RunLogRow>();
   const tasksResult = await database.prepare(
     `SELECT
@@ -125,7 +131,8 @@ export async function loadLogSnapshot(database: LogDatabase): Promise<PublicLogS
     FROM feed_tasks AS task
     INNER JOIN runs AS run ON run.run_id = task.run_id
     WHERE datetime(run.started_at) >= datetime('now', '-7 days')
-    ORDER BY datetime(run.started_at) DESC, task.podcast_name, task.feed_url_hash`,
+    ORDER BY datetime(run.started_at) DESC, task.podcast_name, task.feed_url_hash
+    LIMIT ${LOG_MAX_FEED_TASK_ROWS}`,
   ).all<FeedTaskLogRow>();
 
   const feedsByRun = new Map<string, PublicFeedTaskLog[]>();
@@ -338,11 +345,36 @@ export function renderLogsHtml(snapshot: PublicLogSnapshot): string {
 </html>`;
 }
 
+// 按 D1 绑定对象缓存快照：同一 isolate 内的匿名刷新风暴最多每 60s 触发一次 D1 查询。
+// 缓存的是 in-flight Promise 而非完成值，冷启动时的并发请求共享同一次查询；失败即驱逐。
+const snapshotCache = new WeakMap<
+  LogDatabase,
+  { expiresAt: number; snapshot: Promise<PublicLogSnapshot> }
+>();
+
+function loadLogSnapshotCached(database: LogDatabase): Promise<PublicLogSnapshot> {
+  const cached = snapshotCache.get(database);
+  if (cached !== undefined && Date.now() < cached.expiresAt) {
+    return cached.snapshot;
+  }
+  const entry = {
+    expiresAt: Date.now() + LOG_SNAPSHOT_TTL_MS,
+    snapshot: loadLogSnapshot(database),
+  };
+  snapshotCache.set(database, entry);
+  entry.snapshot.catch(() => {
+    if (snapshotCache.get(database) === entry) {
+      snapshotCache.delete(database);
+    }
+  });
+  return entry.snapshot;
+}
+
 export async function logsResponse(
   database: LogDatabase,
   format: "html" | "json",
 ): Promise<Response> {
-  const snapshot = await loadLogSnapshot(database);
+  const snapshot = await loadLogSnapshotCached(database);
   if (format === "json") {
     return Response.json(snapshot, { headers: LOG_RESPONSE_HEADERS });
   }

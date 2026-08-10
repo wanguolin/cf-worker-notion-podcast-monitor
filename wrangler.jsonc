@@ -11,6 +11,9 @@
   "env": {
     "finance-production": {
       "name": "cf-worker-notion-podcast-monitor-finance-production",
+      "secrets": {
+        "required": ["NOTION_TOKEN", "MANUAL_TRIGGER_TOKEN"]
+      },
       "vars": {
         "ENV_NAME": "finance-production",
         "NOTION_MONITOR_DS_ID": "6770eb15-6002-4bd9-8791-53f8fc968cab",
@@ -20,6 +23,10 @@
         "RSS_CONNECT_TIMEOUT_MS": 15000,
         "RSS_TIMEOUT_MS": 300000,
         "RSS_MAX_REDIRECTS": 5,
+        // 上限须保证最坏情况在软截止内单次尝试完成：全新单集成功路径为每集 4 次
+        // 串行 ~1s Notion 请求（首次排重、写前复查、创建、创建后验证），另有 schema
+        // 读取、父页更新、下载解析与退避余量；防止恶意 Feed 烧满预算堵塞串行队列。
+        "RSS_MAX_WINDOW_ITEMS": 100,
         "MESSAGE_SOFT_DEADLINE_MS": 720000,
         // Non-empty allowlist enables real writes only for the listed feed hashes.
         "CANARY_FEED_HASHES": "",

@@ -51,9 +51,14 @@ function statement(options: {
   return prepared as D1PreparedStatement;
 }
 
-function databaseForLogs(runs: Row[], tasks: Row[]): D1Database {
+function databaseForLogs(
+  runs: Row[],
+  tasks: Row[],
+  onQuery?: (query: string) => void,
+): D1Database {
   return {
     prepare(query: string): D1PreparedStatement {
+      onQuery?.(query);
       return statement({
         allRows: query.includes("FROM feed_tasks AS task") ? tasks : runs,
       });
@@ -145,7 +150,7 @@ describe("public observability endpoints", () => {
 
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toBe("text/html; charset=utf-8");
-    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("Cache-Control")).toBe("public, max-age=60");
     expect(response.headers.get("X-Robots-Tag")).toBe("noindex");
     expect(html).toContain("频道总数");
     expect(html).toContain("新增单集");
@@ -176,7 +181,7 @@ describe("public observability endpoints", () => {
     const serialized = JSON.stringify(body);
 
     expect(response.status).toBe(200);
-    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("Cache-Control")).toBe("public, max-age=60");
     expect(response.headers.get("X-Robots-Tag")).toBe("noindex");
     expect(body.retention_days).toBe(7);
     expect(body.runs[0]?.already_exists_count).toBe(2);
@@ -206,6 +211,65 @@ describe("public observability endpoints", () => {
     );
     expect(rejected.status).toBe(405);
     expect(rejected.headers.get("Allow")).toBe("GET");
+  });
+
+  it("bounds log queries with LIMIT and reuses the snapshot for the same database", async () => {
+    const queries: string[] = [];
+    const environment = envWithDatabase(databaseForLogs(runs, tasks, (query) => queries.push(query)));
+
+    await worker.fetch(new Request("https://worker.example/logs"), environment);
+    const queryCountAfterFirst = queries.length;
+    expect(queryCountAfterFirst).toBeGreaterThan(0);
+    expect(queries.every((query) => /LIMIT \d+/.test(query))).toBe(true);
+
+    const cachedResponse = await worker.fetch(
+      new Request("https://worker.example/logs.json"),
+      environment,
+    );
+    expect(cachedResponse.status).toBe(200);
+    expect(queries.length).toBe(queryCountAfterFirst);
+  });
+
+  it("shares one in-flight snapshot load across concurrent cold requests", async () => {
+    const queries: string[] = [];
+    const environment = envWithDatabase(databaseForLogs(runs, tasks, (query) => queries.push(query)));
+
+    const responses = await Promise.all(
+      Array.from({ length: 10 }, () =>
+        worker.fetch(new Request("https://worker.example/logs.json"), environment),
+      ),
+    );
+
+    expect(responses.every((response) => response.status === 200)).toBe(true);
+    expect(queries.length).toBe(2);
+  });
+
+  it("evicts a failed snapshot load instead of caching the rejection", async () => {
+    let failuresRemaining = 1;
+    const queries: string[] = [];
+    const healthy = databaseForLogs(runs, tasks, (query) => queries.push(query));
+    const database = {
+      ...healthy,
+      prepare(query: string): D1PreparedStatement {
+        if (failuresRemaining > 0) {
+          failuresRemaining -= 1;
+          throw new Error("d1_unavailable");
+        }
+        return healthy.prepare(query);
+      },
+    } as D1Database;
+    const environment = envWithDatabase(database);
+
+    await expect(
+      worker.fetch(new Request("https://worker.example/logs.json"), environment),
+    ).rejects.toThrow("d1_unavailable");
+
+    const recovered = await worker.fetch(
+      new Request("https://worker.example/logs.json"),
+      environment,
+    );
+    expect(recovered.status).toBe(200);
+    expect(queries.length).toBe(2);
   });
 });
 

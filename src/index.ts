@@ -1549,6 +1549,7 @@ export async function handleQueue(
             maxRedirects: env.RSS_MAX_REDIRECTS,
             connectTimeoutMs: env.RSS_CONNECT_TIMEOUT_MS,
             totalTimeoutMs: env.RSS_TIMEOUT_MS,
+            maxWindowItems: env.RSS_MAX_WINDOW_ITEMS,
             softDeadlineAt,
           },
         );
@@ -1887,6 +1888,7 @@ async function runRssSelftest(request: Request, env: WorkerEnv): Promise<Respons
         maxRedirects: env.RSS_MAX_REDIRECTS,
         connectTimeoutMs: env.RSS_CONNECT_TIMEOUT_MS,
         totalTimeoutMs: env.RSS_TIMEOUT_MS,
+        maxWindowItems: env.RSS_MAX_WINDOW_ITEMS,
         softDeadlineAt: Date.now() + env.MESSAGE_SOFT_DEADLINE_MS,
       },
     );
