@@ -26,10 +26,10 @@
         "description": "Notion Internal Integration secret. Only share the duplicated template page and grant Read, Insert, and Update content capabilities."
       },
       "NOTION_MONITOR_DATA_SOURCE_ID": {
-        "description": "Data source ID of the duplicated `财经播客监控` database. This is not the database page ID."
+        "description": "Plaintext identifier of your duplicated `财经播客监控` data source. Replace the author's default; this is not the database page ID or a credential."
       },
       "NOTION_EPISODE_DATA_SOURCE_ID": {
-        "description": "Data source ID of the duplicated `财经播客单集库` database. This is not the database page ID."
+        "description": "Plaintext identifier of your duplicated `财经播客单集库` data source. Replace the author's default; this is not the database page ID or a credential."
       },
       "MANUAL_TRIGGER_TOKEN": {
         "description": "A random bearer token for protected manual endpoints. Generate one with `openssl rand -hex 32`."

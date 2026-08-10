@@ -1,6 +1,4 @@
-# The Deploy to Cloudflare flow presents these values as protected inputs.
-# Never commit real values to this file or paste them into issues and logs.
+# Credentials only. Never commit real values or paste them into issues and logs.
+# The two Notion data source IDs are non-sensitive vars in wrangler.jsonc.
 NOTION_TOKEN=secret_replace_me
-NOTION_MONITOR_DATA_SOURCE_ID=replace_with_monitor_data_source_id
-NOTION_EPISODE_DATA_SOURCE_ID=replace_with_episode_data_source_id
 MANUAL_TRIGGER_TOKEN=replace_with_openssl_rand_hex_32

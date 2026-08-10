@@ -5,25 +5,26 @@
   "compatibility_date": "2026-08-08",
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
 
-  // Secrets are environment-specific and must never be stored here.
-  // Deploy-button users are prompted for all required values from .dev.vars.example:
+  // Only credentials are Secrets and must never be stored here.
+  // Notion data source IDs are non-sensitive identifiers; deploy-button users
+  // must replace them with IDs from their own duplicated template.
   // npx wrangler secret put NOTION_TOKEN --env finance-production
   // npx wrangler secret put MANUAL_TRIGGER_TOKEN --env finance-production
-  // npx wrangler secret put NOTION_MONITOR_DATA_SOURCE_ID --env finance-production
-  // npx wrangler secret put NOTION_EPISODE_DATA_SOURCE_ID --env finance-production
   "env": {
     "finance-production": {
       "name": "cf-worker-notion-podcast-monitor-finance-production",
       "secrets": {
         "required": [
           "NOTION_TOKEN",
-          "MANUAL_TRIGGER_TOKEN",
-          "NOTION_MONITOR_DATA_SOURCE_ID",
-          "NOTION_EPISODE_DATA_SOURCE_ID"
+          "MANUAL_TRIGGER_TOKEN"
         ]
       },
       "vars": {
         "ENV_NAME": "finance-production",
+        // Identifiers, not credentials. Fork/deploy users must use the IDs from
+        // their own duplicated Notion template, never the author's databases.
+        "NOTION_MONITOR_DATA_SOURCE_ID": "70ab2c1d-337f-47e8-b58e-eb111d575c6e",
+        "NOTION_EPISODE_DATA_SOURCE_ID": "293f5041-58b5-49ad-83cd-c7cf5bfe426a",
         "RSS_WINDOW_HOURS": 26,
         "RSS_MAX_BYTES": 33554432,
         "RSS_CONNECT_TIMEOUT_MS": 15000,

@@ -6,6 +6,8 @@
 
 > Notion 可复制模板已经完成结构化制作，尚需仓库维护者在 Notion 后台执行一次 **Publish → Duplicate as template**。公开链接会在发布后补到本段；在此之前，请不要使用作者私有数据库的 ID。
 
+如果你习惯让 Codex、Claude Code 等编码 Agent 完成初始化，复制模板后可以直接使用仓库内的 [Agent 初始化提示词](AGENT_SETUP_PROMPT.md)。
+
 ## 它解决什么问题
 
 这个项目把“播客清单”和“新单集资料库”都放在 Notion：
@@ -44,6 +46,15 @@ Queue 是 at-least-once，不保证消息只投递一次。项目用 D1 唯一�
 ## 1. 准备 Notion
 
 ### 复制模板
+
+模板发布后，按下面的顺序导入并交给 Agent：
+
+1. 打开本 README 顶部的公开模板链接，点击 **Duplicate**，选择你自己的 Notion 工作区。不要直接在作者模板上配置。
+2. 在你的编码 Agent 中启用 Notion Connector/MCP，登录刚才的工作区，并确保复制后的模板根页面对该连接可见。
+3. 让 Agent 搜索精确标题「财经播客 RSS 云端增量同步 · 开源模板」，再读取其下两张数据库。Agent 返回的 `collection://...` 标识就是各自的 Data source ID。
+4. 另行创建给 Worker 使用的最小权限 Internal Integration，并把复制后的模板根页面共享给它。Agent 的 Connector 和 Worker 的 Integration 是两条独立授权链路。
+
+如果 Agent 搜不到模板，先检查它连接的是不是复制目标所在的工作区、该页面是否对连接可见；不要把 Notion token 粘贴给 Agent 作为替代方案。
 
 公开模板会同时复制两张数据库：
 
@@ -116,18 +127,40 @@ curl -sS "https://api.notion.com/v1/databases/${NOTION_DATABASE_ID}" \
 
 部署脚本会先以绑定名 `DB` 执行远程 D1 migrations，再发布 Worker。Cloudflare 官方说明见 [Deploy to Cloudflare buttons](https://developers.cloudflare.com/workers/platform/deploy-buttons/)。
 
-部署页面会要求填写四个受保护值：
+部署页面会要求确认两个明文变量，并填写两个受保护的 Secret：
 
-| 名称 | 填什么 |
-| --- | --- |
-| `NOTION_TOKEN` | Notion Internal Integration secret |
-| `NOTION_MONITOR_DATA_SOURCE_ID` | 复制后「财经播客监控」的 Data source ID |
-| `NOTION_EPISODE_DATA_SOURCE_ID` | 复制后「财经播客单集库」的 Data source ID |
-| `MANUAL_TRIGGER_TOKEN` | `openssl rand -hex 32` 生成的随机字符串 |
+| 名称 | 类型 | 填什么 |
+| --- | --- | --- |
+| `NOTION_MONITOR_DATA_SOURCE_ID` | 明文 var | 复制后「财经播客监控」的 Data source ID；必须替换作者默认值 |
+| `NOTION_EPISODE_DATA_SOURCE_ID` | 明文 var | 复制后「财经播客单集库」的 Data source ID；必须替换作者默认值 |
+| `NOTION_TOKEN` | Secret | Notion Internal Integration secret |
+| `MANUAL_TRIGGER_TOKEN` | Secret | `openssl rand -hex 32` 生成的随机字符串 |
+
+Data source ID 只负责定位数据库，本身不授予读取或写入权限，因此不需要当作凭证保密；真正的权限来自 `NOTION_TOKEN` 及该 Integration 被分享到的页面范围。ID 可以提交到你的仓库，但不要误用作者模板的 ID。
 
 保持默认 Queue 名时，无需改其他配置。如果在部署页重命名 DLQ，请同时把 `FEED_TASKS_DLQ_NAME` 改成完全相同的名称。
 
 > Cloudflare 的 Deploy 按钮只支持公开的 GitHub/GitLab 仓库。Fork 后如果把仓库改成私有，按钮不能再作为模板源使用，但已经建立的 Workers Builds 不受影响。
+
+### 部署命令为什么是 `npm run deploy`
+
+Cloudflare Workers Builds 的 Deploy command 应保持为：
+
+```bash
+npm run deploy
+```
+
+目标用户通过部署按钮完成首次部署后，后续推送通常会由 Workers Builds 自动执行这条命令，不需要每次手动部署。不要改成裸 `wrangler deploy`：本项目的 `npm run deploy` 会先运行 `npm run db:migrate:remote`，把 D1 migrations 应用到绑定名 `DB`，成功后才发布 `finance-production` Worker。
+
+## 用 Agent 完成首次配置
+
+Clone 或由部署按钮创建仓库后，在已经打开该仓库的编码 Agent 中发送：
+
+```text
+请完整读取并严格执行 AGENT_SETUP_PROMPT.md，完成我的 Notion 模板副本和 Cloudflare Worker 的首次配置。所有 Secret 都只能通过终端交互设置，不要让我粘贴到聊天、代码或日志。
+```
+
+完整流程和验收边界见 [AGENT_SETUP_PROMPT.md](AGENT_SETUP_PROMPT.md)。它会让 Agent 自动读取你复制后的两张 Notion 数据库、替换 Data source ID、设置 Cloudflare vars/Secrets、先用 `DRY_RUN=true` 验证，再在获得你明确确认后开启真实写入。
 
 ## 3. 部署后验证
 
@@ -247,4 +280,4 @@ npm run deploy
 
 ## 许可证
 
-仓库公开前需要由维护者选择并添加开源许可证。未附许可证时，公开可见不等于获得使用、修改和再分发授权。
+本项目采用 [MIT License](LICENSE)。
