@@ -4,10 +4,16 @@
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/wanguolin/cf-worker-notion-podcast-monitor)
 
-> [!WARNING]
-> **Notion 公开模板尚未发布。** 模板结构已经完成，但维护者仍需打开「财经播客 RSS 云端增量同步 · 开源模板」，执行 **Share → Publish → Publish**，再到 **Site customization → Header** 打开 **Duplicate as template** 并选择 **Publish changes**。公开 `notion.site` 链接补到这里以前，普通用户无法完成“复制模板”阶段，也绝不能使用作者的私有 Data source ID。
+**Notion 公开模板：** <https://polymaster.notion.site/RSS-3b8cc64d809c8186a0d9fb64ea062f5f>
 
-**Notion 模板：待发布**
+打开后点击右上角 **Duplicate** 即可把模板（含「财经播客监控」「财经播客单集库」两张数据库和安全示例行）复制到你自己的 Notion workspace。注意：模板页里显示的 Data source ID 是模板本体的定位符，部署时必须换成你自己副本的 ID，阶段 1 和阶段 2 会带你完成。
+
+**运行范例（作者生产库的公开只读页，展示部署后的实际效果）：**
+
+- [财经播客监控 · 按分类浏览](https://polymaster.notion.site/50c1050d341c46a7ae53615c3f836d80?v=e48e97752d454f19bdf8ddde0b3e42a0)——抓取清单，每个播客一个父页；
+- [财经播客单集库 · 全部单集](https://polymaster.notion.site/2eb39bd5476343939cadffed2972da03?v=3b6cc64d809c81d58a89000c3b54c52a)——Worker 每日增量写入的结果库。
+
+范例仅供浏览效果，部署请从上面的公开模板 Duplicate；不要把范例库共享给你自己的 Worker。
 
 ## 让 Agent 带你完成部署
 
@@ -87,6 +93,8 @@ claude mcp add --transport http cloudflare-api https://mcp.cloudflare.com/mcp
 
 > [!IMPORTANT]
 > 以下内容是给负责部署的 Agent 的强制指令。Agent 必须完整阅读 README、`AGENTS.md`、`CLAUDE.md`、`wrangler.jsonc` 和 `package.json` 后再开始操作。
+>
+> `AGENTS.md` 与 `CLAUDE.md` 面向仓库维护者：其中的关键不变量与工程约束同样适用于你，但其中提到的作者环境细节——私有 Notion 业务规约页面、`polymaster.workers.dev` 示例 URL、push 后自动部署的本地 hook——都不属于用户的部署环境。部署流程与两份文件冲突时，以本 README 为准；不要尝试访问你无权限的作者 Notion 页面。
 
 Agent 必须遵守：
 
@@ -114,7 +122,7 @@ Agent 在每个阶段结束时用下面的格式向用户汇报：
 Agent 执行只读检查：
 
 1. 确认当前仓库是用户准备部署的副本，并记录 Git remote；如果是作者仓库的只读 Clone，解释部署按钮会在用户账号创建自己的副本。
-2. 检查 Node.js 20+、npm、Git；本地 Wrangler 命令使用仓库依赖，不要求全局安装。
+2. 检查 Node.js 20+、npm、Git，然后在仓库根目录运行 `npm install`；后续所有 `npx wrangler`、`npm run typecheck`、`npm test` 都依赖仓库内安装的依赖，不要求全局安装 Wrangler。
 3. 通过 Notion MCP 的 `fetch self` 或等价工具回读当前 workspace 和用户身份。
 4. 通过 Cloudflare API MCP 回读当前 Cloudflare account；不得只依据 OAuth 成功页面判断。
 5. 确认用户拥有 GitHub/GitLab 账号、Cloudflare Workers Paid 计划，以及创建 Worker、D1、Queues 和 Cron 的权限。本项目的 `cpu_ms=300000` 依赖 Workers Paid 能力。
@@ -141,7 +149,7 @@ Agent 执行只读检查：
 内容同步时间：1970-01-01 00:00:00（Asia/Shanghai）
 ```
 
-如果公开模板链接仍显示“尚未发布”，Agent 必须在此停止并告诉用户等待维护者发布；不得回退使用 README、Git 历史或作者 `wrangler.jsonc` 中的 ID。
+如果公开模板链接打不开、页面上没有 **Duplicate** 入口，或用户复制后的副本缺少任一数据库，Agent 必须在此停止并让用户联系维护者；不得回退使用 README、Git 历史或作者 `wrangler.jsonc` 中的 ID——仓库 `wrangler.jsonc` 里预填的两个 Data source ID 指向作者的模板本体，Duplicate 后你的副本会得到两个新 ID，必须以副本为准。
 
 ### 模板契约
 
@@ -158,11 +166,17 @@ Agent 执行只读检查：
 | 封面 | Files | Gallery 封面 |
 | 最后更新 | Last edited time | Notion 系统字段 |
 
-「财经播客单集库」是结果库。`单集标题`、`播客名称`、`排重键` 是核心字段；其他字段为：
+「财经播客单集库」是结果库。硬性要求只有三条，违反任意一条 Worker 会以稳定错误码拒绝写入：
+
+1. 必须存在一个 Title 类型属性（模板中为 `单集标题`）；
+2. 必须存在且只有一个名称含「播客名称」语义的文本类属性（`播客名称`，Text）；
+3. 必须存在且只有一个名称含「排重」或「去重」语义的文本类属性（`排重键`，Text）——如果出现两个都带“排重”字样的属性，Worker 会因歧义报错。
+
+其他字段为可选展示字段，Worker 会读取实际 schema、按属性名别名和实际类型动态适配写入；某字段缺失时只会略过对应信息，不会失败：
 
 `分类`、`语言`、`发布日期`、`上海时间`、`GUID`、`原始链接`、`媒体下载`、`媒体类型`、`媒体长度(Byte)`、`作者`、`时长`、`季`、`集`、`节目类型`、`显式内容`、`RSS分类`、`关键词`、`封面链接`、`逐字稿链接`、`RSS源`、`简介`、`加入时间`、`行更新时间`。
 
-Agent 发现字段缺失、重名或属性类型不符时必须 fail closed，向用户报告，不得自行发明映射。
+Agent 验收时按上面三条硬性要求 fail closed：字段缺失、重名歧义或类型不符必须向用户报告，不得自行发明映射。从公开模板 Duplicate 会原样保留全部属性类型，正常情况下无需手工修正。
 
 ## 阶段 2：创建 Worker 专用的 Notion Integration
 
@@ -210,9 +224,11 @@ Agent 指导用户点击 README 顶部按钮。Cloudflare 会把仓库复制到�
 | `NOTION_EPISODE_DATA_SOURCE_ID` | 明文 var | 自己模板副本的单集库 Data source ID |
 | `NOTION_TOKEN` | Secret | 用户直接粘贴到 Cloudflare 加密输入框，不经过 Agent 对话 |
 | `MANUAL_TRIGGER_TOKEN` | Secret | 用户在不向 Agent 共享输出的终端或密码管理器中生成随机值，直接填入加密输入框并安全保存；可使用 `openssl rand -hex 32` |
-| `DRY_RUN` | 明文 var | 首次部署必须为 `true` |
+| `DRY_RUN` | 明文 var | **表单会从仓库默认值预填 `false`，用户必须手动改成 `true`**；首次部署严禁保持 `false` |
 
 保持默认 Queue 名时不要修改 `FEED_TASKS_DLQ_NAME`；如果改了 DLQ 名，两者必须完全一致。
+
+如果部署表单没有展示上述变量、Secret 或 D1/Queue 资源（例如平台未能解析 `env.finance-production` 配置），不要盲目点击部署：停止并改走下面的 CLI 备用路径。
 
 Workers Builds 的 Deploy command 必须是：
 
@@ -225,6 +241,8 @@ npm run deploy
 ### CLI 备用路径
 
 只有部署按钮不可用，且用户明确同意 Agent 创建 Cloudflare 资源时，才使用 Cloudflare API MCP 或 Wrangler 逐项创建新的 D1、两个 Queue 和 Worker，并把返回的资源 ID 写回用户副本。不得复用仓库作者的 D1 database ID。
+
+本地 Wrangler 需要先登录一次：让用户在终端运行 `npx wrangler login` 完成浏览器 OAuth（凭证保存在用户本机，不经过 Agent 对话）。走 CLI 路径时，首次发布前必须先把用户副本 `wrangler.jsonc` 中的 `DRY_RUN` 改为 `true` 再执行 `npm run deploy`。
 
 设置 Secret 时，Agent 只启动交互式命令，把隐藏输入交给用户：
 
@@ -245,13 +263,13 @@ Agent 使用 Cloudflare MCP、Wrangler 或两者交叉验证：
 4. `NOTION_TOKEN`、`MANUAL_TRIGGER_TOKEN` 只以 Secret 名称出现，不能读取或显示值。
 5. `DRY_RUN=true`，`CANARY_FEED_HASHES` 默认为空。
 6. Build command 为 `npm run deploy`。
-7. 部署按钮创建的用户仓库已持久化用户自己的 Data source ID 和新 D1 ID；如果没有，Agent 应修改用户仓库并提交，否则下一次构建可能把 Dashboard 配置覆盖回作者默认值。
+7. 部署按钮创建的用户仓库已持久化用户自己的 Data source ID、新 D1 ID **和 `DRY_RUN: true`**；如果没有，Agent 应修改用户仓库并提交。这一步必须做：Workers Builds 每次构建都以仓库里的 `wrangler.jsonc` 为准，仓库里残留作者默认值（含 `DRY_RUN: false`）会在下一次 push 时静默覆盖 Dashboard 配置。
 
 ## 阶段 4：零写入验收
 
 用户把 `MANUAL_TRIGGER_TOKEN` 安全保存在本机 gitignored 的 `.env` 中。Agent 只能检查变量是否存在，不得读取、打印或总结其值。
 
-Agent 从 Cloudflare 回读 Worker URL，等待新版本传播，然后验证：
+Agent 从 Cloudflare 回读 Worker URL；没有 MCP 时，可用 `npx wrangler deployments list --env finance-production` 或 Cloudflare Dashboard 查看，默认 workers.dev 地址形如 `https://cf-worker-notion-podcast-monitor-finance-production.<账号子域>.workers.dev`。等待新版本传播，然后验证：
 
 ```bash
 curl -sS "$WORKER_URL/health" | jq
@@ -284,6 +302,8 @@ curl -sS -X POST "$WORKER_URL/trigger-run" \
   -H "Authorization: Bearer $MANUAL_TRIGGER_TOKEN" | jq
 ```
 
+也可以用仓库自带脚本代替最后一条命令，它会自动从 `.env` 读取 token：`npm run trigger -- $WORKER_URL`。
+
 验收通过条件：
 
 - `/health` 成功；
@@ -307,7 +327,7 @@ Agent 必须先向用户展示阶段 4 的无敏感信息摘要，并询问：
 
 1. 在用户部署副本中把 `DRY_RUN` 改为 `false`；
 2. 运行 `npx wrangler types`、`npm run typecheck`、`npm test`；
-3. 使用 `npm run deploy` 发布；
+3. 发布：走部署按钮 / Workers Builds 路径时，提交并 push 到用户仓库默认分支即触发自动构建部署；走 CLI 路径时运行 `npm run deploy`（需已 `npx wrangler login`）。两条路径都要把 `DRY_RUN: false` 持久化进用户仓库，避免下一次构建回退；
 4. 回读 `DRY_RUN=false`；
 5. 先只配置一个真实播客做小范围验证，再根据用户决定扩展清单。
 
@@ -405,20 +425,19 @@ npm run deploy
 | `POST /parent-check` | Bearer token | 否 | 父页同步 callout preflight |
 | `POST /trigger-run` | Bearer token | 取决于写入开关 | 手动执行完整 Producer |
 
-## 维护者：发布 Notion 模板
+## 维护者：Notion 模板的发布与维护
 
-这个开关只存在于 Notion 页面右上角，不在 Notion Integration 后台，也不在 Cloudflare：
+模板已于 2026-08-10 发布，公开链接见 README 顶部。发布状态核查记录：模板根页含两张数据库；「财经播客监控」仅 1 行安全示例（RSS 为空、正文仅一个内容同步时间 callout）、「财经播客单集库」为空库；单集库满足三条硬性 schema 要求（`单集标题` Title、`播客名称` Text、`排重键` Text，均唯一）。模板库与生产库是相互独立的两套数据库，公开模板不含任何私有播客清单或历史单集。
+
+后续修改模板内容后，需要重新发布才会反映到公开链接。发布开关只存在于 Notion 页面右上角，不在 Notion Integration 后台，也不在 Cloudflare：
 
 1. 用维护者账号打开「财经播客 RSS 云端增量同步 · 开源模板」。
-2. 点击右上角 **Share**。
-3. 打开 **Publish** 标签，点击 **Publish**。
-4. 进入 **Site customization → Header**。
-5. 打开 **Duplicate as template**。
-6. 点击顶部 **Publish changes**。
-7. 返回 **Share → Publish**，复制生成的 `notion.site` URL。
-8. 用该 URL 替换 README 顶部的“尚未发布”警告，并实际用另一个 Notion workspace 测试 Duplicate 是否同时复制两张数据库和安全示例行。
+2. 点击右上角 **Share**，打开 **Publish** 标签。
+3. 确认 **Site customization → Header** 中 **Duplicate as template** 保持开启。
+4. 点击 **Publish changes**。
+5. 如果 `notion.site` URL 发生变化（例如取消发布后重新发布），同步更新 README 顶部链接，并用另一个 Notion 账号或无痕窗口测试 Duplicate 是否完整复制两张数据库和安全示例行。
 
-Notion 会默认连同子页面一起发布；操作前应再次确认模板不含私有播客清单、历史单集、内部规约、成员信息或其他不应公开的内容。详见 [Notion Sites 发布说明](https://www.notion.com/help/public-pages-and-web-publishing) 和 [公开页面复制说明](https://www.notion.com/help/duplicate-public-pages)。
+Notion 会默认连同子页面一起发布；重新发布前应再次确认模板不含私有播客清单、历史单集、内部规约、成员信息或其他不应公开的内容。详见 [Notion Sites 发布说明](https://www.notion.com/help/public-pages-and-web-publishing) 和 [公开页面复制说明](https://www.notion.com/help/duplicate-public-pages)。
 
 ## 许可证
 
