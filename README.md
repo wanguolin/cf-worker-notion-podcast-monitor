@@ -4,7 +4,7 @@
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/wanguolin/cf-worker-notion-podcast-monitor)
 
-> Notion 可复制模板已经完成结构化制作，尚需仓库维护者在 Notion 后台执行一次 **Publish → Duplicate as template**。公开链接会在发布后补到本段；在此之前，请不要使用作者私有数据库的 ID。
+> Notion 可复制模板已经完成结构化制作。仓库维护者尚需在模板页执行 **Share → Publish → Publish**，再到 **Site customization → Header** 打开 **Duplicate as template** 并选择 **Publish changes**。随后把生成的 `notion.site` 链接补到本段；在此之前，请不要使用作者私有数据库的 ID。详见 [Notion 官方发布说明](https://www.notion.com/help/public-pages-and-web-publishing)。
 
 如果你习惯让 Codex、Claude Code 等编码 Agent 完成初始化，复制模板后可以直接使用仓库内的 [Agent 初始化提示词](AGENT_SETUP_PROMPT.md)。
 
