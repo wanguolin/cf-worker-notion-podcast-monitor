@@ -5,7 +5,7 @@ import worker, {
   type FeedTaskMessage,
   type WorkerEnv,
 } from "../src/index";
-import { pruneOldRuns } from "../src/observability";
+import { detectCronAnomalies, pruneOldRuns } from "../src/observability";
 
 type Row = Record<string, unknown>;
 
@@ -355,5 +355,68 @@ describe("D1 observability bookkeeping", () => {
     expect(values[3]).toBe("Podcast A / Podcast B");
     expect(values[4]).toBe("feeds.example.com");
     expect(values[4]).not.toBe(fullFeedUrl);
+  });
+});
+
+describe("cron anomaly detection", () => {
+  const cronRun = (scheduledAt: string) => ({
+    cron: "0 16 * * *",
+    scheduled_at: scheduledAt,
+    started_at: scheduledAt,
+  });
+  const manualRun = (startedAt: string) => ({
+    cron: "manual-trigger",
+    scheduled_at: startedAt,
+    started_at: startedAt,
+  });
+
+  it("flags an expected daily tick with no cron run record", () => {
+    const anomalies = detectCronAnomalies(
+      [
+        cronRun("2026-08-11T16:00:02.000Z"),
+        cronRun("2026-08-10T16:00:00.000Z"),
+        manualRun("2026-08-09T03:33:24.158Z"),
+      ],
+      Date.parse("2026-08-12T03:00:00.000Z"),
+    );
+    expect(anomalies).toHaveLength(1);
+    expect(anomalies[0]?.type).toBe("cron_missing");
+    expect(anomalies[0]?.expected_at).toBe("2026-08-09T16:00:00.000Z");
+    expect(anomalies[0]?.detail).not.toMatch(/https?:|Bearer|secret/i);
+  });
+
+  it("returns nothing when every tick is covered within tolerance", () => {
+    const anomalies = detectCronAnomalies(
+      [
+        cronRun("2026-08-11T16:00:59.000Z"),
+        cronRun("2026-08-10T16:00:00.000Z"),
+      ],
+      Date.parse("2026-08-12T10:00:00.000Z"),
+    );
+    expect(anomalies).toEqual([]);
+  });
+
+  it("does not judge ticks before the earliest retained record or too close to now", () => {
+    // 最早记录在 16:00 之后 → 当天的期望时刻不判定；今天的时刻未到容忍期也不判定。
+    const anomalies = detectCronAnomalies(
+      [manualRun("2026-08-10T20:00:00.000Z")],
+      Date.parse("2026-08-11T16:10:00.000Z"),
+    );
+    expect(anomalies).toEqual([]);
+  });
+
+  it("flags a manual-only history once the tick passes tolerance", () => {
+    const anomalies = detectCronAnomalies(
+      [manualRun("2026-08-10T03:00:00.000Z")],
+      Date.parse("2026-08-11T17:00:00.000Z"),
+    );
+    expect(anomalies.map((entry) => entry.expected_at)).toEqual([
+      "2026-08-11T16:00:00.000Z",
+      "2026-08-10T16:00:00.000Z",
+    ]);
+  });
+
+  it("returns nothing for an empty run history", () => {
+    expect(detectCronAnomalies([], Date.parse("2026-08-12T00:00:00.000Z"))).toEqual([]);
   });
 });

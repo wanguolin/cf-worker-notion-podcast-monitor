@@ -66,8 +66,69 @@ export type PublicRunLog = Omit<RunLogRow, "run_id"> & {
 export type PublicLogSnapshot = {
   generated_at: string;
   retention_days: number;
+  anomalies: PublicLogAnomaly[];
   runs: PublicRunLog[];
 };
+
+// 期望的每日 Cron 触发时刻（UTC）。必须与 wrangler.jsonc triggers.crons 保持一致，
+// 调整 Cron 计划时同步修改，否则 /logs 会误报「Cron 缺失」。
+const EXPECTED_CRON_UTC_HOUR = 16;
+const EXPECTED_CRON_UTC_MINUTE = 0;
+// 理论触发时刻与记录的 scheduled_at 允许的偏差；某个时刻过去这么久仍无记录即判缺失。
+const CRON_MATCH_TOLERANCE_MS = 30 * 60 * 1_000;
+const DAY_MS = 24 * 60 * 60 * 1_000;
+
+export type PublicLogAnomaly = {
+  type: "cron_missing";
+  expected_at: string;
+  detail: string;
+};
+
+// 纯派生检测：Cron 若某天根本没触发，不存在任何能写日志的进程，
+// 所以只能在渲染时对照期望时刻与 runs 记录补出异常，不落库、不写路径。
+export function detectCronAnomalies(
+  runs: ReadonlyArray<Pick<RunLogRow, "cron" | "scheduled_at" | "started_at">>,
+  nowMs: number,
+): PublicLogAnomaly[] {
+  const startTimes = runs
+    .map((run) => Date.parse(run.started_at))
+    .filter((value) => Number.isFinite(value));
+  if (startTimes.length === 0) {
+    return [];
+  }
+  // 留存窗口内最早记录之前的时刻不判定：无法区分「Cron 缺失」与「当时尚未部署/日志已清理」。
+  const earliestMs = Math.min(...startTimes);
+  const cronScheduledTimes = runs
+    .filter((run) => !run.cron.startsWith("manual"))
+    .map((run) => Date.parse(run.scheduled_at))
+    .filter((value) => Number.isFinite(value));
+  const earliest = new Date(earliestMs);
+  const firstTick = Date.UTC(
+    earliest.getUTCFullYear(),
+    earliest.getUTCMonth(),
+    earliest.getUTCDate(),
+    EXPECTED_CRON_UTC_HOUR,
+    EXPECTED_CRON_UTC_MINUTE,
+  );
+  const anomalies: PublicLogAnomaly[] = [];
+  for (let tick = firstTick; tick <= nowMs - CRON_MATCH_TOLERANCE_MS; tick += DAY_MS) {
+    if (tick < earliestMs) {
+      continue;
+    }
+    const covered = cronScheduledTimes.some(
+      (scheduled) => Math.abs(scheduled - tick) <= CRON_MATCH_TOLERANCE_MS,
+    );
+    if (!covered) {
+      const expectedAt = new Date(tick).toISOString();
+      anomalies.push({
+        type: "cron_missing",
+        expected_at: expectedAt,
+        detail: `期望 ${formatShanghai(expectedAt)}（Asia/Shanghai）触发的每日 Cron 没有运行记录`,
+      });
+    }
+  }
+  return anomalies.reverse();
+}
 
 function elapsedMilliseconds(startedAt: string | null, finishedAt: string | null): number | null {
   if (startedAt === null || finishedAt === null) {
@@ -162,6 +223,7 @@ export async function loadLogSnapshot(database: LogDatabase): Promise<PublicLogS
   return {
     generated_at: new Date().toISOString(),
     retention_days: LOG_RETENTION_DAYS,
+    anomalies: detectCronAnomalies(runsResult.results, Date.now()),
     runs: runsResult.results.map((row) => {
       const feeds = feedsByRun.get(row.run_id) ?? [];
       return {
@@ -297,6 +359,16 @@ function feedRows(feeds: PublicFeedTaskLog[]): string {
     .join("");
 }
 
+function anomalyBanner(anomalies: PublicLogAnomaly[]): string {
+  if (anomalies.length === 0) {
+    return "";
+  }
+  const items = anomalies
+    .map((anomaly) => `<li>${escapeHtml(anomaly.detail)}</li>`)
+    .join("");
+  return `<section class="anomaly"><h2>⚠ 异常</h2><ul>${items}</ul></section>`;
+}
+
 function runSections(runs: PublicRunLog[]): string {
   if (runs.length === 0) {
     return "";
@@ -333,11 +405,12 @@ export function renderLogsHtml(snapshot: PublicLogSnapshot): string {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>财经播客同步日志</title>
   <style>
-    :root{color-scheme:light;--bg:#f4f6f8;--panel:#fff;--ink:#17202a;--muted:#68737d;--line:#dfe4e8;--good:#147d46;--bad:#bd2c2c;--warn:#9a6700}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif}main{width:min(1180px,calc(100% - 24px));margin:28px auto}h1,h2,p{margin:0}header p,.run-head p,footer{color:var(--muted)}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin:18px 0 24px}.card,.run,.empty{background:var(--panel);border:1px solid var(--line);border-radius:12px}.card{padding:13px}.card span{display:block;color:var(--muted);font-size:12px}.card strong{display:block;margin-top:3px;font-size:17px;overflow-wrap:anywhere}.run{margin:14px 0;padding:16px}.run-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.run-head h2{font-size:17px}.run-summary{display:flex;flex-wrap:wrap;gap:8px 16px;margin:12px 0;color:var(--muted)}.status{display:inline-flex;padding:2px 8px;border-radius:999px;background:#edf0f2;white-space:nowrap}.status.good{color:var(--good);background:#e7f6ed}.status.bad{color:var(--bad);background:#fdecec}.status.warn{color:var(--warn);background:#fff4d6}.table-wrap{overflow-x:auto}table{width:100%;min-width:920px;border-collapse:collapse}th,td{padding:9px 10px;border-top:1px solid var(--line);text-align:left;white-space:nowrap}th{color:var(--muted);font-size:12px}code{font-size:12px}.empty{padding:30px;text-align:center;color:var(--muted)}.empty-cell{text-align:center;color:var(--muted)}footer{text-align:center;padding:24px 0 8px}@media(max-width:600px){main{margin-top:18px}.run{padding:12px}.cards{grid-template-columns:repeat(2,minmax(0,1fr))}}
+    :root{color-scheme:light;--bg:#f4f6f8;--panel:#fff;--ink:#17202a;--muted:#68737d;--line:#dfe4e8;--good:#147d46;--bad:#bd2c2c;--warn:#9a6700}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif}main{width:min(1180px,calc(100% - 24px));margin:28px auto}h1,h2,p{margin:0}header p,.run-head p,footer{color:var(--muted)}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin:18px 0 24px}.card,.run,.empty{background:var(--panel);border:1px solid var(--line);border-radius:12px}.card{padding:13px}.card span{display:block;color:var(--muted);font-size:12px}.card strong{display:block;margin-top:3px;font-size:17px;overflow-wrap:anywhere}.run{margin:14px 0;padding:16px}.run-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.run-head h2{font-size:17px}.run-summary{display:flex;flex-wrap:wrap;gap:8px 16px;margin:12px 0;color:var(--muted)}.status{display:inline-flex;padding:2px 8px;border-radius:999px;background:#edf0f2;white-space:nowrap}.status.good{color:var(--good);background:#e7f6ed}.status.bad{color:var(--bad);background:#fdecec}.status.warn{color:var(--warn);background:#fff4d6}.table-wrap{overflow-x:auto}table{width:100%;min-width:920px;border-collapse:collapse}th,td{padding:9px 10px;border-top:1px solid var(--line);text-align:left;white-space:nowrap}th{color:var(--muted);font-size:12px}code{font-size:12px}.empty{padding:30px;text-align:center;color:var(--muted)}.empty-cell{text-align:center;color:var(--muted)}footer{text-align:center;padding:24px 0 8px}.anomaly{background:#fff4d6;border:1px solid #e5c65a;border-radius:12px;padding:14px 16px;margin:16px 0;color:var(--warn)}.anomaly h2{font-size:15px}.anomaly ul{margin:8px 0 0;padding-left:20px}@media(max-width:600px){main{margin-top:18px}.run{padding:12px}.cards{grid-template-columns:repeat(2,minmax(0,1fr))}}
   </style>
 </head>
 <body><main>
   <header><h1>财经播客同步日志</h1><p>时间均为 Asia/Shanghai</p></header>
+  ${anomalyBanner(snapshot.anomalies)}
   <div class="cards">${summaryCards(snapshot.runs[0])}</div>
   ${runSections(snapshot.runs)}
   <footer>日志滚动保留 ${escapeHtml(snapshot.retention_days)} 天</footer>
