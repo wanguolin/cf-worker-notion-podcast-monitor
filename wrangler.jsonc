@@ -23,8 +23,8 @@
         "ENV_NAME": "finance-production",
         // Identifiers, not credentials. Fork/deploy users must use the IDs from
         // their own duplicated Notion template, never the author's databases.
-        "NOTION_MONITOR_DATA_SOURCE_ID": "70ab2c1d-337f-47e8-b58e-eb111d575c6e",
-        "NOTION_EPISODE_DATA_SOURCE_ID": "293f5041-58b5-49ad-83cd-c7cf5bfe426a",
+        "NOTION_MONITOR_DATA_SOURCE_ID": "6770eb15-6002-4bd9-8791-53f8fc968cab",
+        "NOTION_EPISODE_DATA_SOURCE_ID": "c6518896-0a17-43bb-8f95-b88933d211cb",
         "RSS_WINDOW_HOURS": 26,
         "RSS_MAX_BYTES": 33554432,
         "RSS_CONNECT_TIMEOUT_MS": 15000,
