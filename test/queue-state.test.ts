@@ -4,8 +4,11 @@ import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  CATCHUP_CRON,
   handleQueue,
+  PRIMARY_CRON,
   reconcilePreviousRuns,
+  shouldRunCatchup,
   type FeedTaskMessage,
   type WorkerEnv,
 } from "../src/index";
@@ -123,6 +126,42 @@ function feedTaskMessage(runId: string, taskId: string): FeedTaskMessage {
 }
 
 describe("Queue and run terminal-state recovery", () => {
+  it("skips the watchdog without creating a run when the primary tick exists", async () => {
+    const { database, sqlite } = migratedDatabase();
+    sqlite
+      .prepare(
+        `INSERT INTO runs (
+          run_id, cron, scheduled_at, started_at, status, heartbeat_at
+        ) VALUES (?, ?, ?, ?, 'succeeded', ?)`,
+      )
+      .run(
+        "primary-run",
+        PRIMARY_CRON,
+        "2026-08-09T16:00:02.000Z",
+        "2026-08-09T16:00:03.000Z",
+        "2026-08-09T16:01:00.000Z",
+      );
+
+    await expect(
+      shouldRunCatchup(database, Date.parse("2026-08-09T16:30:07.000Z")),
+    ).resolves.toBe(false);
+    expect(sqlite.prepare("SELECT COUNT(*) AS count FROM runs").get()).toEqual({ count: 1 });
+    expect(
+      sqlite.prepare("SELECT COUNT(*) AS count FROM runs WHERE cron = ?").get(CATCHUP_CRON),
+    ).toEqual({ count: 0 });
+    sqlite.close();
+  });
+
+  it("requests the watchdog producer when the guarded primary tick is absent", async () => {
+    const { database, sqlite } = migratedDatabase();
+
+    await expect(
+      shouldRunCatchup(database, Date.parse("2026-08-09T16:30:07.000Z")),
+    ).resolves.toBe(true);
+    expect(sqlite.prepare("SELECT COUNT(*) AS count FROM runs").get()).toEqual({ count: 0 });
+    sqlite.close();
+  });
+
   it("dead-letters a non-terminal task, finalizes its run, and always acknowledges the DLQ message", async () => {
     const { database, sqlite } = migratedDatabase();
     sqlite

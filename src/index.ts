@@ -41,6 +41,10 @@ const PRODUCER_LOCK_NAME = "catalog_outbox_producer";
 const QUEUE_SEND_BATCH_SIZE = 100;
 const QUEUE_MESSAGE_SAFE_BYTES = 120_000;
 const QUEUE_SEND_BATCH_SAFE_BYTES = 240_000;
+// Must stay in sync with wrangler.jsonc triggers.crons.
+export const PRIMARY_CRON = "0 16 * * *";
+export const CATCHUP_CRON = "30 16 * * *";
+const CATCHUP_PRIMARY_MATCH_TOLERANCE_MS = 30 * 60 * 1_000;
 
 type Secrets = {
   readonly NOTION_TOKEN?: string;
@@ -212,6 +216,41 @@ function writeLog(entry: StructuredLog): void {
 
 function stableRunId(controller: ScheduledController): string {
   return `cron:${controller.cron}:scheduled:${controller.scheduledTime}`;
+}
+
+export async function shouldRunCatchup(
+  database: D1Database,
+  scheduledTime: number,
+): Promise<boolean> {
+  const scheduledDate = new Date(scheduledTime);
+  const primaryTick = Date.UTC(
+    scheduledDate.getUTCFullYear(),
+    scheduledDate.getUTCMonth(),
+    scheduledDate.getUTCDate(),
+    16,
+    0,
+    0,
+    0,
+  );
+  const windowStart = new Date(
+    primaryTick - CATCHUP_PRIMARY_MATCH_TOLERANCE_MS,
+  ).toISOString();
+  const windowEnd = new Date(
+    primaryTick + CATCHUP_PRIMARY_MATCH_TOLERANCE_MS,
+  ).toISOString();
+  const primaryRun = await database
+    .prepare(
+      `SELECT 1 AS matched
+      FROM runs
+      WHERE cron = ?
+        AND scheduled_at >= ?
+        AND scheduled_at <= ?
+      LIMIT 1`,
+    )
+    .bind(PRIMARY_CRON, windowStart, windowEnd)
+    .first<{ matched: number }>();
+
+  return primaryRun === null;
 }
 
 export function queueRetryDelaySeconds(attempts: number): number {
@@ -1005,6 +1044,18 @@ async function handleProducer(
 }
 
 async function handleScheduled(controller: ScheduledController, env: WorkerEnv): Promise<void> {
+  if (
+    controller.cron === CATCHUP_CRON &&
+    !(await shouldRunCatchup(env.DB, controller.scheduledTime))
+  ) {
+    writeLog({
+      level: "info",
+      event: "catchup_skipped",
+      status: "primary_run_exists",
+    });
+    return;
+  }
+
   await handleProducer(
     {
       runId: stableRunId(controller),

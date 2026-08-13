@@ -54,7 +54,7 @@ queue() → Consumer：单 Feed 串行——流式下载解析 → 26h 窗口 �
 ## 其他约定
 
 - compatibility_date 受本地 wrangler 内置 workerd 上限约束（当前 2026-08-08），升级 wrangler 前不要手动调后。
-- 生产 Cron 为 `0 16 * * *`（每日 00:00 Asia/Shanghai）；DRY_RUN=false、CANARY_FEED_HASHES 为空即全量真实写入。回滚开关：置 DRY_RUN=true 重新部署即停写。
+- 生产主 Cron 为 `0 16 * * *`（每日 00:00 Asia/Shanghai），`30 16 * * *` 是 00:30 watchdog：仅在 D1 没有对应主 Cron 运行记录时自愈补跑；DRY_RUN=false、CANARY_FEED_HASHES 为空即全量真实写入。回滚开关：置 DRY_RUN=true 重新部署即停写。
 - 大体积测试 fixture 由 `test/fixtures/generate-feed.ts` 生成，不提交大文件进 git。
 - 日志为 JSON 单行结构化格式，含稳定 error_code；绝不输出 token、Authorization 或完整 Feed URL。
 - `/logs` 与 `/logs.json` 是公开只读端点；渲染与 JSON 内容禁止出现 token、Authorization、完整 Feed URL 或 `error_summary` 原文。

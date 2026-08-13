@@ -70,12 +70,13 @@ export type PublicLogSnapshot = {
   runs: PublicRunLog[];
 };
 
-// 期望的每日 Cron 触发时刻（UTC）。必须与 wrangler.jsonc triggers.crons 保持一致，
-// 调整 Cron 计划时同步修改，否则 /logs 会误报「Cron 缺失」。
+// 期望的每日主 Cron 触发时刻（UTC）。必须与 wrangler.jsonc 的主 Cron 保持一致；
+// watchdog 等任意非 manual Cron 运行落入覆盖窗口时，也视为该主 tick 已覆盖。
 const EXPECTED_CRON_UTC_HOUR = 16;
 const EXPECTED_CRON_UTC_MINUTE = 0;
-// 理论触发时刻与记录的 scheduled_at 允许的偏差；某个时刻过去这么久仍无记录即判缺失。
-const CRON_MATCH_TOLERANCE_MS = 30 * 60 * 1_000;
+const CRON_COVERAGE_EARLY_MS = 30 * 60 * 1_000;
+// +2h 是补跑仍能保住 26h 窗口连续性的上限；超过后才判该主 tick 缺失。
+const CRON_COVERAGE_LATE_MS = 2 * 60 * 60 * 1_000;
 const DAY_MS = 24 * 60 * 60 * 1_000;
 
 export type PublicLogAnomaly = {
@@ -111,12 +112,14 @@ export function detectCronAnomalies(
     EXPECTED_CRON_UTC_MINUTE,
   );
   const anomalies: PublicLogAnomaly[] = [];
-  for (let tick = firstTick; tick <= nowMs - CRON_MATCH_TOLERANCE_MS; tick += DAY_MS) {
+  for (let tick = firstTick; tick <= nowMs - CRON_COVERAGE_LATE_MS; tick += DAY_MS) {
     if (tick < earliestMs) {
       continue;
     }
     const covered = cronScheduledTimes.some(
-      (scheduled) => Math.abs(scheduled - tick) <= CRON_MATCH_TOLERANCE_MS,
+      (scheduled) =>
+        scheduled >= tick - CRON_COVERAGE_EARLY_MS &&
+        scheduled <= tick + CRON_COVERAGE_LATE_MS,
     );
     if (!covered) {
       const expectedAt = new Date(tick).toISOString();
