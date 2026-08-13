@@ -1,6 +1,6 @@
 # 财经播客 RSS 云端增量同步
 
-用 Notion 管理播客清单，由 Cloudflare Worker 每天抓取 RSS/Atom，把近 26 小时的新单集严格排重后写回 Notion。整个流程运行在 Cloudflare Cron、Queues 和 D1 上，不依赖常驻服务器，也不需要每天启动 AI 会话。
+用 Notion 管理播客清单，由 Cloudflare Worker 每 8 小时抓取 RSS/Atom，把近 26 小时的新单集严格排重后写回 Notion。整个流程运行在 Cloudflare Cron、Queues 和 D1 上，不依赖常驻服务器，也不需要启动 AI 会话。
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/wanguolin/cf-worker-notion-podcast-monitor)
 
@@ -11,7 +11,7 @@
 **运行范例（作者生产库的公开只读页，展示部署后的实际效果）：**
 
 - [财经播客监控 · 按分类浏览](https://polymaster.notion.site/50c1050d341c46a7ae53615c3f836d80?v=e48e97752d454f19bdf8ddde0b3e42a0)——抓取清单，每个播客一个父页；
-- [财经播客单集库 · 全部单集](https://polymaster.notion.site/2eb39bd5476343939cadffed2972da03?v=3b6cc64d809c81d58a89000c3b54c52a)——Worker 每日增量写入的结果库。
+- [财经播客单集库 · 全部单集](https://polymaster.notion.site/2eb39bd5476343939cadffed2972da03?v=3b6cc64d809c81d58a89000c3b54c52a)——Worker 每 8 小时增量写入的结果库。
 
 范例仅供浏览效果，部署请从上面的公开模板 Duplicate；不要把范例库共享给你自己的 Worker。
 
@@ -185,7 +185,7 @@ Agent 先向用户解释区别：
 | 连接 | 身份 | 用途 | 凭证去向 |
 | --- | --- | --- | --- |
 | Notion MCP | 用户 OAuth | Agent 查找、读取和配置模板 | MCP Client 的凭证存储 |
-| Notion Internal Integration | Notion bot | 已部署 Worker 每日读写两张数据库 | Cloudflare Secret `NOTION_TOKEN` |
+| Notion Internal Integration | Notion bot | 已部署 Worker 每 8 小时读写两张数据库 | Cloudflare Secret `NOTION_TOKEN` |
 
 ### 用户操作
 
@@ -213,7 +213,7 @@ Agent 指导用户点击 README 顶部按钮。Cloudflare 会把仓库复制到�
 - 1 个 D1 database；
 - 1 个 Feed task Queue；
 - 1 个 DLQ；
-- 每日 Cron Trigger；
+- 每 8 小时 Cron Trigger；
 - Workers Builds 持续部署。
 
 部署表单中必须确认：
@@ -350,7 +350,7 @@ Agent 的最终报告必须包含：
 
 ![财经播客 RSS 云端增量同步架构](docs/architecture.png)
 
-1. Cron 每天 `00:00 Asia/Shanghai`（`0 16 * * *` UTC）触发 Producer，也可通过受保护端点手动补跑。
+1. Cron 每日 `00:00/08:00/16:00 Asia/Shanghai`（`0 0,8,16 * * *` UTC）三班触发 Producer，也可通过受保护端点手动补跑；26 小时窗口让相邻 tick 天然互为备份，无 watchdog。
 2. Producer 查询「财经播客监控」的全部当前非归档行；同一 RSS 的多条父页映射会合并，每个唯一 RSS 生成一个 D1 outbox 任务。
 3. 消息成功送入 Cloudflare Queue 后，任务从 `pending_enqueue` 变为 `queued`；发送结果不确定时可以安全重投。
 4. Consumer 以 `max_batch_size=1`、`max_concurrency=1` 每次只处理一个 Feed。

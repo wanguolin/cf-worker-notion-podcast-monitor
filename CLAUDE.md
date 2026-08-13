@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概览
 
-Cloudflare Worker：每日 00:00（Asia/Shanghai，Cron `0 16 * * *` UTC）抓取"财经播客监控"Notion 库中的 RSS，流式解析后把 26 小时窗口内的新单集严格排重写入"财经播客单集库"，并更新播客父页的"内容同步时间"。**业务规则以 Notion 页面"财经播客 RSS 云端增量同步"为准**（排重、窗口、父页更新条件、禁止事项）；工程约束见本文件"关键不变量"。原实施计划 plan.md 已在上线后删除，历史版本可在 git 历史中查看。
+Cloudflare Worker：每日 00:00/08:00/16:00（Asia/Shanghai，Cron `0 0,8,16 * * *` UTC）三班抓取"财经播客监控"Notion 库中的 RSS，流式解析后把 26 小时窗口内的新单集严格排重写入"财经播客单集库"，并更新播客父页的"内容同步时间"。**业务规则以 Notion 页面"财经播客 RSS 云端增量同步"为准**（排重、窗口、父页更新条件、禁止事项）；工程约束见本文件"关键不变量"。原实施计划 plan.md 已在上线后删除，历史版本可在 git 历史中查看。
 
 ## 常用命令
 
@@ -54,7 +54,7 @@ queue() → Consumer：单 Feed 串行——流式下载解析 → 26h 窗口 �
 ## 其他约定
 
 - compatibility_date 受本地 wrangler 内置 workerd 上限约束（当前 2026-08-08），升级 wrangler 前不要手动调后。
-- 生产主 Cron 为 `0 16 * * *`（每日 00:00 Asia/Shanghai），`30 16 * * *` 是 00:30 watchdog：仅在 D1 没有对应主 Cron 运行记录时自愈补跑；DRY_RUN=false、CANARY_FEED_HASHES 为空即全量真实写入。回滚开关：置 DRY_RUN=true 重新部署即停写。
+- 生产 Cron 为 `0 0,8,16 * * *`（每日 00:00/08:00/16:00 Asia/Shanghai 三班）；每 8 小时一次配合 26 小时窗口，三个 tick 天然互为备份，无 watchdog。DRY_RUN=false、CANARY_FEED_HASHES 为空即全量真实写入。回滚开关：置 DRY_RUN=true 重新部署即停写。
 - 大体积测试 fixture 由 `test/fixtures/generate-feed.ts` 生成，不提交大文件进 git。
 - 日志为 JSON 单行结构化格式，含稳定 error_code；绝不输出 token、Authorization 或完整 Feed URL。
 - `/logs` 与 `/logs.json` 是公开只读端点；渲染与 JSON 内容禁止出现 token、Authorization、完整 Feed URL 或 `error_summary` 原文。

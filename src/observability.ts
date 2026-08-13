@@ -1,8 +1,9 @@
 const LOG_RETENTION_DAYS = 7;
 // 公开匿名端点：行数上限与快照缓存共同封顶单请求的 D1 读取成本，
-// 防止刷新风暴放大 D1 费用。上限远高于 7 天正常量（每日 1 次 cron + 少量手动补跑）。
-const LOG_MAX_RUN_ROWS = 40;
-const LOG_MAX_FEED_TASK_ROWS = 2_000;
+// 防止刷新风暴放大 D1 费用。7 天 × 每天 3 班 = 21 个常规 run；60 为手动补跑留足余量。
+const LOG_MAX_RUN_ROWS = 60;
+// 当前约 38 个 Feed：21 × 38 ≈ 800 条常规明细；4000 兼顾手动补跑与清单增长。
+const LOG_MAX_FEED_TASK_ROWS = 4_000;
 const LOG_SNAPSHOT_TTL_MS = 60_000;
 
 const LOG_RESPONSE_HEADERS = {
@@ -70,14 +71,15 @@ export type PublicLogSnapshot = {
   runs: PublicRunLog[];
 };
 
-// 期望的每日主 Cron 触发时刻（UTC）。必须与 wrangler.jsonc 的主 Cron 保持一致；
-// watchdog 等任意非 manual Cron 运行落入覆盖窗口时，也视为该主 tick 已覆盖。
-const EXPECTED_CRON_UTC_HOUR = 16;
+// 期望的每 8 小时 Cron 触发时刻（UTC）。必须与 wrangler.jsonc 保持同步；
+// 任意非 manual Cron 运行落入覆盖窗口时，都视为对应 tick 已覆盖。
+const EXPECTED_CRON_UTC_HOURS = [0, 8, 16] as const;
 const EXPECTED_CRON_UTC_MINUTE = 0;
 const CRON_COVERAGE_EARLY_MS = 30 * 60 * 1_000;
-// +2h 是补跑仍能保住 26h 窗口连续性的上限；超过后才判该主 tick 缺失。
+// +2h 是触发延迟/短时补跑容忍；最晚运行与前一准点 tick 相隔 10h，26h 窗口仍重叠 16h。
 const CRON_COVERAGE_LATE_MS = 2 * 60 * 60 * 1_000;
-const DAY_MS = 24 * 60 * 60 * 1_000;
+// 三个等距 UTC 小时点将一天切成三个 8 小时 tick。
+const CRON_TICK_INTERVAL_MS = 8 * 60 * 60 * 1_000;
 
 export type PublicLogAnomaly = {
   type: "cron_missing";
@@ -85,7 +87,7 @@ export type PublicLogAnomaly = {
   detail: string;
 };
 
-// 纯派生检测：Cron 若某天根本没触发，不存在任何能写日志的进程，
+// 纯派生检测：Cron 若某一班根本没触发，不存在任何能写日志的进程，
 // 所以只能在渲染时对照期望时刻与 runs 记录补出异常，不落库、不写路径。
 export function detectCronAnomalies(
   runs: ReadonlyArray<Pick<RunLogRow, "cron" | "scheduled_at" | "started_at">>,
@@ -108,11 +110,15 @@ export function detectCronAnomalies(
     earliest.getUTCFullYear(),
     earliest.getUTCMonth(),
     earliest.getUTCDate(),
-    EXPECTED_CRON_UTC_HOUR,
+    EXPECTED_CRON_UTC_HOURS[0],
     EXPECTED_CRON_UTC_MINUTE,
   );
   const anomalies: PublicLogAnomaly[] = [];
-  for (let tick = firstTick; tick <= nowMs - CRON_COVERAGE_LATE_MS; tick += DAY_MS) {
+  for (
+    let tick = firstTick;
+    tick <= nowMs - CRON_COVERAGE_LATE_MS;
+    tick += CRON_TICK_INTERVAL_MS
+  ) {
     if (tick < earliestMs) {
       continue;
     }
@@ -126,7 +132,7 @@ export function detectCronAnomalies(
       anomalies.push({
         type: "cron_missing",
         expected_at: expectedAt,
-        detail: `期望 ${formatShanghai(expectedAt)}（Asia/Shanghai）触发的每日 Cron 没有运行记录`,
+        detail: `期望 ${formatShanghai(expectedAt)}（Asia/Shanghai）触发的每 8 小时 Cron 没有运行记录`,
       });
     }
   }

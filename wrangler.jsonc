@@ -42,8 +42,8 @@
         "DRY_RUN": false
       },
       "triggers": {
-        // Cloudflare Cron uses UTC: primary at 00:00 and watchdog at 00:30 Asia/Shanghai.
-        "crons": ["0 16 * * *", "30 16 * * *"]
+        // Cloudflare Cron uses UTC: 00:00/08:00/16:00 UTC = 08:00/16:00/00:00 Asia/Shanghai.
+        "crons": ["0 0,8,16 * * *"]
       },
       "limits": {
         "cpu_ms": 300000

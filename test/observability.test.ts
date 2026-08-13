@@ -359,7 +359,7 @@ describe("D1 observability bookkeeping", () => {
 });
 
 describe("cron anomaly detection", () => {
-  const cronRun = (scheduledAt: string, cron = "0 16 * * *") => ({
+  const cronRun = (scheduledAt: string, cron = "0 0,8,16 * * *") => ({
     cron,
     scheduled_at: scheduledAt,
     started_at: scheduledAt,
@@ -370,50 +370,42 @@ describe("cron anomaly detection", () => {
     started_at: startedAt,
   });
 
-  it("flags an expected daily tick with no cron run record", () => {
+  it("returns nothing for consecutive normal three-shift ticks", () => {
     const anomalies = detectCronAnomalies(
       [
-        cronRun("2026-08-11T16:00:02.000Z"),
-        cronRun("2026-08-10T16:00:00.000Z"),
-        manualRun("2026-08-09T03:33:24.158Z"),
+        cronRun("2026-08-10T00:00:00.000Z"),
+        cronRun("2026-08-10T08:00:00.000Z"),
+        cronRun("2026-08-10T16:00:59.000Z"),
       ],
-      Date.parse("2026-08-12T03:00:00.000Z"),
+      Date.parse("2026-08-10T18:00:00.000Z"),
     );
-    expect(anomalies).toHaveLength(1);
+    expect(anomalies).toEqual([]);
+  });
+
+  it("flags only a missing middle shift", () => {
+    const anomalies = detectCronAnomalies(
+      [
+        cronRun("2026-08-10T00:00:00.000Z"),
+        cronRun("2026-08-10T16:00:00.000Z"),
+      ],
+      Date.parse("2026-08-10T18:00:00.000Z"),
+    );
+    expect(anomalies.map((entry) => entry.expected_at)).toEqual([
+      "2026-08-10T08:00:00.000Z",
+    ]);
     expect(anomalies[0]?.type).toBe("cron_missing");
-    expect(anomalies[0]?.expected_at).toBe("2026-08-09T16:00:00.000Z");
+    expect(anomalies[0]?.detail).toContain("每 8 小时 Cron");
     expect(anomalies[0]?.detail).not.toMatch(/https?:|Bearer|secret/i);
-  });
-
-  it("returns nothing when every tick is covered within tolerance", () => {
-    const anomalies = detectCronAnomalies(
-      [
-        cronRun("2026-08-11T16:00:59.000Z"),
-        cronRun("2026-08-10T16:00:00.000Z"),
-      ],
-      Date.parse("2026-08-12T10:00:00.000Z"),
-    );
-    expect(anomalies).toEqual([]);
-  });
-
-  it("treats a watchdog run at tick plus 30 minutes as coverage", () => {
-    const anomalies = detectCronAnomalies(
-      [
-        cronRun("2026-08-10T16:00:00.000Z"),
-        cronRun("2026-08-11T16:30:00.000Z", "30 16 * * *"),
-      ],
-      Date.parse("2026-08-12T10:00:00.000Z"),
-    );
-    expect(anomalies).toEqual([]);
   });
 
   it("accepts the tick plus two-hour boundary as coverage", () => {
     const anomalies = detectCronAnomalies(
       [
+        cronRun("2026-08-10T00:00:00.000Z"),
+        cronRun("2026-08-10T10:00:00.000Z"),
         cronRun("2026-08-10T16:00:00.000Z"),
-        cronRun("2026-08-11T18:00:00.000Z", "30 16 * * *"),
       ],
-      Date.parse("2026-08-12T10:00:00.000Z"),
+      Date.parse("2026-08-10T18:00:00.000Z"),
     );
     expect(anomalies).toEqual([]);
   });
@@ -421,21 +413,36 @@ describe("cron anomaly detection", () => {
   it("flags a run just outside the tick plus two-hour boundary", () => {
     const anomalies = detectCronAnomalies(
       [
+        cronRun("2026-08-10T00:00:00.000Z"),
+        cronRun("2026-08-10T10:00:00.001Z"),
         cronRun("2026-08-10T16:00:00.000Z"),
-        cronRun("2026-08-11T18:00:00.001Z", "30 16 * * *"),
       ],
-      Date.parse("2026-08-12T10:00:00.000Z"),
+      Date.parse("2026-08-10T18:00:00.000Z"),
     );
     expect(anomalies.map((entry) => entry.expected_at)).toEqual([
-      "2026-08-11T16:00:00.000Z",
+      "2026-08-10T08:00:00.000Z",
+    ]);
+  });
+
+  it("does not count a manual run as tick coverage", () => {
+    const anomalies = detectCronAnomalies(
+      [
+        cronRun("2026-08-10T00:00:00.000Z"),
+        manualRun("2026-08-10T08:00:00.000Z"),
+        cronRun("2026-08-10T16:00:00.000Z"),
+      ],
+      Date.parse("2026-08-10T18:00:00.000Z"),
+    );
+    expect(anomalies.map((entry) => entry.expected_at)).toEqual([
+      "2026-08-10T08:00:00.000Z",
     ]);
   });
 
   it("does not judge ticks before the earliest retained record or too close to now", () => {
-    // 最早记录在 16:00 之后 → 当天的期望时刻不判定；今天的时刻未到容忍期也不判定。
+    // 从最早记录所在 UTC 日 00:00 起迭代；记录前的 tick 与未过 +2h 的 tick 都不判定。
     const anomalies = detectCronAnomalies(
-      [manualRun("2026-08-10T20:00:00.000Z")],
-      Date.parse("2026-08-11T16:10:00.000Z"),
+      [manualRun("2026-08-10T03:00:00.000Z")],
+      Date.parse("2026-08-10T09:30:00.000Z"),
     );
     expect(anomalies).toEqual([]);
   });
@@ -443,11 +450,11 @@ describe("cron anomaly detection", () => {
   it("flags a manual-only history once the late coverage window has passed", () => {
     const anomalies = detectCronAnomalies(
       [manualRun("2026-08-10T03:00:00.000Z")],
-      Date.parse("2026-08-11T19:00:00.000Z"),
+      Date.parse("2026-08-10T19:00:00.000Z"),
     );
     expect(anomalies.map((entry) => entry.expected_at)).toEqual([
-      "2026-08-11T16:00:00.000Z",
       "2026-08-10T16:00:00.000Z",
+      "2026-08-10T08:00:00.000Z",
     ]);
   });
 
