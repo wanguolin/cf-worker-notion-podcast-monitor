@@ -75,6 +75,9 @@ export type PublicLogSnapshot = {
 // 任意非 manual Cron 运行落入覆盖窗口时，都视为对应 tick 已覆盖。
 const EXPECTED_CRON_UTC_HOURS = [0, 8, 16] as const;
 const EXPECTED_CRON_UTC_MINUTE = 0;
+const LEGACY_DAILY_CRON_UTC_HOUR = 16;
+// 2026-08-13 03:15 UTC 部署三班 Cron；此前生产是每日 `0 16 * * *` 一班。
+const THREE_SHIFT_CADENCE_SINCE_MS = Date.UTC(2026, 7, 13, 3, 15);
 const CRON_COVERAGE_EARLY_MS = 30 * 60 * 1_000;
 // +2h 是触发延迟/短时补跑容忍；最晚运行与前一准点 tick 相隔 10h，26h 窗口仍重叠 16h。
 const CRON_COVERAGE_LATE_MS = 2 * 60 * 60 * 1_000;
@@ -122,6 +125,12 @@ export function detectCronAnomalies(
     if (tick < earliestMs) {
       continue;
     }
+    if (
+      tick < THREE_SHIFT_CADENCE_SINCE_MS &&
+      new Date(tick).getUTCHours() !== LEGACY_DAILY_CRON_UTC_HOUR
+    ) {
+      continue;
+    }
     const covered = cronScheduledTimes.some(
       (scheduled) =>
         scheduled >= tick - CRON_COVERAGE_EARLY_MS &&
@@ -129,10 +138,12 @@ export function detectCronAnomalies(
     );
     if (!covered) {
       const expectedAt = new Date(tick).toISOString();
+      const cadenceLabel =
+        tick < THREE_SHIFT_CADENCE_SINCE_MS ? "每日 Cron" : "每 8 小时 Cron";
       anomalies.push({
         type: "cron_missing",
         expected_at: expectedAt,
-        detail: `期望 ${formatShanghai(expectedAt)}（Asia/Shanghai）触发的每 8 小时 Cron 没有运行记录`,
+        detail: `期望 ${formatShanghai(expectedAt)}（Asia/Shanghai）触发的${cadenceLabel} 没有运行记录`,
       });
     }
   }
